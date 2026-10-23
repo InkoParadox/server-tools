@@ -5,7 +5,7 @@ export PYTHONUTF8=1
 command -v python3 >/dev/null || { printf '\033[1;31mSTOP: python3 required\033[0m\n' >&2; exit 1; }
 umask 077
 mist_ipv6_ui_dir=$(mktemp -d /root/mist-ipv6-xshell-XXXXXXXX)
-cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_EE2BC22680CA'
+cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_3E1820B483D0'
 #!/usr/bin/env bash
 set -eu
 export PYTHONUTF8=1
@@ -17,7 +17,7 @@ exec python3 - "$@" <<'MIST_PYTHON'
 import argparse,base64,copy,ctypes,errno,fcntl,socket,struct,collections,glob,hashlib,ipaddress,json,os,pathlib,re,shlex,shutil,signal,stat,subprocess,sys,tempfile,time,uuid
 need_python = sys.version_info >= (3,8)
 if not need_python:raise SystemExit('STOP: Python >=3.8 required; no package installed')
-VERSION='2.0'
+VERSION='2.1'
 APPLY_DEADLINE=None
 ROOT=pathlib.Path('/')
 STATE='/var/lib/mist-ipv6'
@@ -673,6 +673,7 @@ def verify_off(before):
     need(all(v.get('disable_ipv6')==1 for v in now['knobs'].values()),'manager re-enabled IPv6')
     need(not addr_set(now['addr6'],'inet6') and not now['routes6'],'IPv6 address/route remains')
     if before.get('dns_probe_ok',True):run(['getent','ahostsv4','example.com'],timeout=12)
+    if before.get('chrony_ipv4_monitor'):chrony_ipv4_sources()
     return now
 def ssh_session():
     f=os.environ.get('SSH_CONNECTION','').split();need(len(f)==4,'authenticated external IPv4 SSH required (SSH_CONNECTION)')
@@ -698,6 +699,35 @@ def udp_peers(text):
         address=ipaddress.ip_address(host.strip('[]').split('%')[0])
         if address.version==6 and address.ipv4_mapped is None:peers.append(fields[4])
     return peers
+
+def chrony_ipv4_sources():
+    # Read-only monitoring over the exact IPv4 socket that will remain usable.
+    need(shutil.which('chronyc'),'chronyc required to verify the chronyd IPv4 fallback')
+    text=run(['chronyc','-n','-c','-h','127.0.0.1','sources'],timeout=8).stdout
+    selected=False
+    for line in text.splitlines():
+        fields=line.split(',')
+        need(len(fields)==10 and fields[0] in ('^','=','#') and fields[1] in ('*','+','-','?','x','~'),'unrecognised chronyc sources CSV format')
+        if fields[0]=='#':continue
+        try:address=ipaddress.ip_address(fields[2])
+        except ValueError:raise Stop('chronyd time source has no verified IP address: '+fields[2])
+        need(address.version==4,'chronyd has an IPv6 time source: '+fields[2])
+        selected=selected or fields[1]=='*'
+    need(selected,'chronyd has no selected IPv4 time source')
+
+def chrony_loopback_pair(line,listeners4):
+    # No generic loopback/port exemption: identify the daemon and its same-PID pair.
+    fields=line.split()
+    if fields[0]!='udp' or fields[4]!='[::1]:323':return False
+    owners=set(re.findall(r'\("([^"]+)",pid=(\d+),fd=\d+\)',line))
+    if len(owners)!=1:return False
+    name,pid=next(iter(owners))
+    if name!='chronyd':return False
+    paired=any(len(v.split())>=6 and v.split()[0]=='udp' and v.split()[4]=='127.0.0.1:323' and set(re.findall(r'\("([^"]+)",pid=(\d+),fd=\d+\)',v))==owners for v in listeners4)
+    if not paired:return False
+    try:executable=os.readlink(p('/proc/'+pid+'/exe'))
+    except OSError:raise Stop('cannot identify the executable of the chronyd loopback listener')
+    return pathlib.Path(executable).name=='chronyd'
 
 def dependencies(before):
     wireguard_ports=set()
@@ -729,6 +759,8 @@ def dependencies(before):
         if host not in ('*','::'):
             address=ipaddress.ip_address(host)
             if address.version==6 and address.ipv4_mapped is not None:continue
+            if chrony_loopback_pair(l,listeners4):
+                chrony_ipv4_sources();before['chrony_ipv4_monitor']=True;continue
             raise Stop('explicit IPv6 listener dependency: '+local)
         if 'v6only:1' in l:
             port=local.rsplit(':',1)[1];pids=set(re.findall(r'pid=(\d+)',l))
@@ -1167,8 +1199,8 @@ if __name__=='__main__':
     try:main()
     except Exception as e:emit(status='STOP',reason=str(e));sys.exit(1)
 MIST_PYTHON
-MIST_ENGINE_EXACT_EE2BC22680CA
-printf '%s  %s\n' 'ee2bc22680ca5b2d003aed698aa1bdc9dd0f10a3d8549b058fcac5acb5f2b960' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status
+MIST_ENGINE_EXACT_3E1820B483D0
+printf '%s  %s\n' '3e1820b483d0c44e52800527d9cacd192712ce15acf0ca53d9ec148d07b95d2d' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status
 chmod 700 "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 cat > "$mist_ipv6_ui_dir/display.py" <<'MIST_XSHELL_DISPLAY_EOF'
 #!/usr/bin/env python3
@@ -1194,7 +1226,7 @@ def main():
             say('  Сеть: ' + '; '.join(str(k) + ': ' + str(v) for k, v in value.items()), '36')
 
     if human:
-        say('\nMIST | IPv6 V2', '1;36')
+        say('\nMIST | IPv6 V2.1', '1;36')
         if os.environ.get('MIST_IPV6_VERIFIED_SHA'):
             say('[OK] Контрольная сумма исходника проверена', '32')
         if os.environ.get('MIST_IPV6_SAVED_SOURCE'):
@@ -1274,6 +1306,6 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         raise SystemExit(130)
 MIST_XSHELL_DISPLAY_EOF
-export MIST_IPV6_VERIFIED_SHA=ee2bc22680ca5b2d003aed698aa1bdc9dd0f10a3d8549b058fcac5acb5f2b960
+export MIST_IPV6_VERIFIED_SHA=3e1820b483d0c44e52800527d9cacd192712ce15acf0ca53d9ec148d07b95d2d
 export MIST_IPV6_SAVED_SOURCE="$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 bash "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" --apply | python3 "$mist_ipv6_ui_dir/display.py"
