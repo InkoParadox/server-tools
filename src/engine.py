@@ -1165,7 +1165,11 @@ def transaction_view(d):
         boot=p('/proc/sys/kernel/random/boot_id').read_text().strip()
         saved_boot=value.get('boot')
         if saved_boot is None:
-            _,backup=load(d);saved_boot=backup['boot']
+            try:
+                _,backup=load(d);saved_boot=backup['boot']
+            except Exception as error:
+                value.update(same_boot=None,remaining_seconds=None,integrity_error=str(error),watchdog_active=active(unit_paths(d)[0]+'.timer'))
+                return value
         value['same_boot']=saved_boot==boot
         value['remaining_seconds']=max(0,int(value.get('deadline_monotonic',0)-time.monotonic())) if value['same_boot'] else 0
         value['watchdog_active']=active(unit_paths(d)[0]+'.timer')

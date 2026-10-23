@@ -61,6 +61,15 @@ class Transaction(unittest.TestCase):
  def test_legacy_status_boot_falls_back_to_backup(self):
   d=self.apply();e.status_write(d,'awaiting_confirmation',deadline_monotonic=e.time.monotonic()+60)
   view=e.transaction_view(d);self.assertTrue(view['same_boot']);self.assertGreater(view['remaining_seconds'],0)
+ def test_damaged_legacy_backup_does_not_hide_status(self):
+  d=self.apply();e.status_write(d,'awaiting_confirmation',deadline_monotonic=e.time.monotonic()+60)
+  for name in ('backup.json','backup-mirror.json'):(d/name).write_bytes(b'CORRUPT')
+  other=e.p(e.STATE)/'tx-other';other.mkdir();e.status_write(other,'rolled_back')
+  e.p('/run/lock').mkdir(parents=True,exist_ok=True)
+  out=io.StringIO()
+  with patch.object(sys,'argv',['tool','--status']),contextlib.redirect_stdout(out):e.main()
+  rows=json.loads(out.getvalue())['transactions'];self.assertEqual(len(rows),2)
+  damaged=next(x for x in rows if x['transaction']==str(d));self.assertIsNone(damaged['same_boot']);self.assertIsNone(damaged['remaining_seconds']);self.assertIn('both backup copies invalid',damaged['integrity_error']);self.assertTrue(self.armed)
  def test_restore_exact_files_knobs(self):
   d=self.apply()
   with contextlib.redirect_stdout(io.StringIO()):e.restore(d)

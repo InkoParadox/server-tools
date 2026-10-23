@@ -101,6 +101,8 @@ def main():
                 say('  ' + str(tx.get('transaction', '')) + ': ' + str(state), tone)
                 if tx.get('same_boot') is False:
                     say('    Сервер перезагружен: подтверждение закрыто; страховка: ' + str(tx.get('watchdog_active')), '33')
+                elif tx.get('integrity_error'):
+                    say('    Время не подтверждено: ' + str(tx['integrity_error']) + '; страховка: ' + str(tx.get('watchdog_active')), '33')
                 elif 'remaining_seconds' in tx:
                     say('    До автоотката: ' + str(tx['remaining_seconds']) + ' с; страховка: ' + str(tx.get('watchdog_active')), '33')
         else:

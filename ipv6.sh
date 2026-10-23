@@ -5,7 +5,7 @@ export PYTHONUTF8=1
 command -v python3 >/dev/null || { printf '\033[1;31mSTOP: python3 required\033[0m\n' >&2; exit 1; }
 umask 077
 mist_ipv6_ui_dir=$(mktemp -d /root/mist-ipv6-xshell-XXXXXXXX)
-cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_84D1D9A53FD8'
+cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_A5ECAE91CB83'
 #!/usr/bin/env bash
 set -eu
 export PYTHONUTF8=1
@@ -1179,7 +1179,11 @@ def transaction_view(d):
         boot=p('/proc/sys/kernel/random/boot_id').read_text().strip()
         saved_boot=value.get('boot')
         if saved_boot is None:
-            _,backup=load(d);saved_boot=backup['boot']
+            try:
+                _,backup=load(d);saved_boot=backup['boot']
+            except Exception as error:
+                value.update(same_boot=None,remaining_seconds=None,integrity_error=str(error),watchdog_active=active(unit_paths(d)[0]+'.timer'))
+                return value
         value['same_boot']=saved_boot==boot
         value['remaining_seconds']=max(0,int(value.get('deadline_monotonic',0)-time.monotonic())) if value['same_boot'] else 0
         value['watchdog_active']=active(unit_paths(d)[0]+'.timer')
@@ -1232,8 +1236,8 @@ if __name__=='__main__':
     try:main()
     except Exception as e:emit(**dict(getattr(e,'details',{}),status='STOP',reason=str(e)));sys.exit(1)
 MIST_PYTHON
-MIST_ENGINE_EXACT_84D1D9A53FD8
-printf '%s  %s\n' '84d1d9a53fd81c04cdc472248ec319bfe94e7f3fe16eb4ab77f31121106910aa' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
+MIST_ENGINE_EXACT_A5ECAE91CB83
+printf '%s  %s\n' 'a5ecae91cb8316b47506b8522db0940e527d124e43b8dea1d123bfb00e61c5d0' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
 chmod 700 "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 cat > "$mist_ipv6_ui_dir/display.py" <<'MIST_XSHELL_DISPLAY_EOF'
 #!/usr/bin/env python3
@@ -1339,6 +1343,8 @@ def main():
                 say('  ' + str(tx.get('transaction', '')) + ': ' + str(state), tone)
                 if tx.get('same_boot') is False:
                     say('    Сервер перезагружен: подтверждение закрыто; страховка: ' + str(tx.get('watchdog_active')), '33')
+                elif tx.get('integrity_error'):
+                    say('    Время не подтверждено: ' + str(tx['integrity_error']) + '; страховка: ' + str(tx.get('watchdog_active')), '33')
                 elif 'remaining_seconds' in tx:
                     say('    До автоотката: ' + str(tx['remaining_seconds']) + ' с; страховка: ' + str(tx.get('watchdog_active')), '33')
         else:
@@ -1351,7 +1357,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         raise SystemExit(130)
 MIST_XSHELL_DISPLAY_EOF
-export MIST_IPV6_VERIFIED_SHA=84d1d9a53fd81c04cdc472248ec319bfe94e7f3fe16eb4ab77f31121106910aa
+export MIST_IPV6_VERIFIED_SHA=a5ecae91cb8316b47506b8522db0940e527d124e43b8dea1d123bfb00e61c5d0
 export MIST_IPV6_SAVED_SOURCE="$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 [ "$#" -gt 0 ] || set -- --apply
 bash "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" "$@" | python3 "$mist_ipv6_ui_dir/display.py"
