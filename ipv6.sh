@@ -5,7 +5,7 @@ export PYTHONUTF8=1
 command -v python3 >/dev/null || { printf '\033[1;31mSTOP: python3 required\033[0m\n' >&2; exit 1; }
 umask 077
 mist_ipv6_ui_dir=$(mktemp -d /root/mist-ipv6-xshell-XXXXXXXX)
-cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_A5ECAE91CB83'
+cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_20F85A657294'
 #!/usr/bin/env bash
 set -eu
 export PYTHONUTF8=1
@@ -1097,14 +1097,28 @@ def restore(d,automatic=False):
 
 def pending():
     return [d for d in p(STATE).glob('tx-*') if d.is_dir() and read_status(d)['status'] not in ('committed','rolled_back','prepared_failed')]
+def host_context():
+    need(os.stat('/proc/self/ns/net').st_ino == os.stat('/proc/1/ns/net').st_ino, 'run in the host PID 1 network namespace')
+    need(shutil.which('systemd-detect-virt'), 'systemd-detect-virt required to distinguish the host from a container')
+    detected=run(['systemd-detect-virt','--container'],False)
+    need(detected.returncode==1 and detected.stdout.strip()=='none',
+         'container or unverifiable host context; network writes refused: '+detected.stdout.strip())
+
+
 def require_ipv4(before):
-    addresses = [ipaddress.ip_address(a['local']) for row in before.get('addr4', [])
-                 for a in row.get('addr_info', []) if a.get('family') == 'inet']
-    need(any(not (a.is_loopback or a.is_link_local or a.is_unspecified or a.is_multicast) for a in addresses),
-         'no usable non-loopback IPv4 address; IPv6 may be the only host connectivity')
-    routes = [r for r in before.get('routes4', []) if r.get('type', 'unicast') == 'unicast' and r.get('dst') == 'default']
-    need(any(r.get('dev') not in (None, 'lo') or any(n.get('dev') not in (None, 'lo') for n in r.get('nexthops', [])) for r in routes),
-         'no usable IPv4 default route; refusing to remove possible IPv6-only connectivity')
+    links={r['ifname']:r for r in before.get('links',[])}
+    eligible=set()
+    for row in before.get('addr4',[]):
+        name=row.get('ifname');link=links.get(name,{})
+        if 'UP' not in link.get('flags',[]) or link.get('operstate') not in ('UP','UNKNOWN'):continue
+        for a in row.get('addr_info',[]):
+            if a.get('family')!='inet':continue
+            address=ipaddress.ip_address(a['local'])
+            if not (address.is_loopback or address.is_link_local or address.is_unspecified or address.is_multicast):eligible.add(name)
+    need(eligible,'no usable non-loopback IPv4 address on an operational interface; IPv6 may be the only host connectivity')
+    routes=[r for r in before.get('routes4',[]) if r.get('type','unicast')=='unicast' and r.get('dst')=='default' and not {'linkdown','dead'}&set(r.get('flags',[]))]
+    need(any(r.get('dev') in eligible or any(n.get('dev') in eligible and not {'linkdown','dead'}&set(n.get('flags',[])) for n in r.get('nexthops',[])) for r in routes),
+         'no usable IPv4 default route through an operational interface with IPv4; refusing possible IPv6-only connectivity')
 
 
 def apply(seconds):
@@ -1217,7 +1231,7 @@ def main():
     ap.add_argument('--rollback-seconds',type=int,default=600)
     a=ap.parse_args();need(os.geteuid()==0,'root required');need(60<=a.rollback_seconds<=1800,'rollback timeout must be 60..1800 seconds')
     for sig in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP):signal.signal(sig,lambda n,f:(_ for _ in ()).throw(Stop('interrupted by signal '+str(n))))
-    need(os.stat('/proc/self/ns/net').st_ino == os.stat('/proc/1/ns/net').st_ino, 'run in the host PID 1 network namespace')
+    host_context()
     p('/run/lock').mkdir(exist_ok=True)
     fd=os.open(p('/run/lock/mist-ipv6.lock'),os.O_RDWR|os.O_CREAT|getattr(os,'O_NOFOLLOW',0),0o600)
     st=os.fstat(fd);need(stat.S_ISREG(st.st_mode) and st.st_uid==0 and not st.st_mode&0o022,'unsafe transaction lock file')
@@ -1236,8 +1250,8 @@ if __name__=='__main__':
     try:main()
     except Exception as e:emit(**dict(getattr(e,'details',{}),status='STOP',reason=str(e)));sys.exit(1)
 MIST_PYTHON
-MIST_ENGINE_EXACT_A5ECAE91CB83
-printf '%s  %s\n' 'a5ecae91cb8316b47506b8522db0940e527d124e43b8dea1d123bfb00e61c5d0' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
+MIST_ENGINE_EXACT_20F85A657294
+printf '%s  %s\n' '20f85a657294143847490e6c466b4cd0c013ac53ea6d1a8ad51a9aab44db42d1' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
 chmod 700 "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 cat > "$mist_ipv6_ui_dir/display.py" <<'MIST_XSHELL_DISPLAY_EOF'
 #!/usr/bin/env python3
@@ -1357,7 +1371,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         raise SystemExit(130)
 MIST_XSHELL_DISPLAY_EOF
-export MIST_IPV6_VERIFIED_SHA=a5ecae91cb8316b47506b8522db0940e527d124e43b8dea1d123bfb00e61c5d0
+export MIST_IPV6_VERIFIED_SHA=20f85a657294143847490e6c466b4cd0c013ac53ea6d1a8ad51a9aab44db42d1
 export MIST_IPV6_SAVED_SOURCE="$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 [ "$#" -gt 0 ] || set -- --apply
 bash "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" "$@" | python3 "$mist_ipv6_ui_dir/display.py"

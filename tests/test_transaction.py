@@ -14,11 +14,12 @@ class Transaction(unittest.TestCase):
    q=e.p(path);q.parent.mkdir(parents=True,exist_ok=True);q.write_text(value);q.chmod(0o600)
   self.tool=self.root/'tool.sh';self.tool.write_text('# frozen fixture, not executed\n')
   self.env=patch.dict(os.environ,{'SSH_CONNECTION':'198.51.100.1 40000 192.0.2.2 22','MIST_IPV6_SELF':str(self.tool)});self.env.start()
-  self.b={'knobs':e.knobs(),'addr4':[{'ifname':'eth.123','addr_info':[{'family':'inet','local':'192.0.2.2','prefixlen':24,'scope':'global'}]}],'routes4':[{'dst':'default','dev':'eth.123','gateway':'192.0.2.1','protocol':'dhcp','expires':100}],'rules4':[],'links':[{'ifname':'eth.123','mtu':1440}],'resolver':{'link':'../run/systemd/resolve/stub-resolv.conf','data':'fixture'},'promote':{},'addr6':[],'routes6':[],'rules6':[]}
+  self.b={'knobs':e.knobs(),'addr4':[{'ifname':'eth.123','addr_info':[{'family':'inet','local':'192.0.2.2','prefixlen':24,'scope':'global'}]}],'routes4':[{'dst':'default','dev':'eth.123','gateway':'192.0.2.1','protocol':'dhcp','expires':100}],'rules4':[],'links':[{'ifname':'eth.123','mtu':1440,'flags':['UP'],'operstate':'UP'}],'resolver':{'link':'../run/systemd/resolve/stub-resolv.conf','data':'fixture'},'promote':{},'addr6':[],'routes6':[],'rules6':[]}
   self.rt=copy.deepcopy(self.b)
   def runtime():
    r=copy.deepcopy(self.rt);r['knobs']=e.knobs();return r
   self.patch('runtime',runtime)
+  self.patch('host_context',lambda:None)
   self.patch_sleep=patch.object(e.time,'sleep',lambda _:None);self.patch_sleep.start();self.addCleanup(self.patch_sleep.stop)
   self.patch('jr',lambda *a:copy.deepcopy(self.rt['links']))
   def arm(d,seconds):
@@ -70,6 +71,13 @@ class Transaction(unittest.TestCase):
   with patch.object(sys,'argv',['tool','--status']),contextlib.redirect_stdout(out):e.main()
   rows=json.loads(out.getvalue())['transactions'];self.assertEqual(len(rows),2)
   damaged=next(x for x in rows if x['transaction']==str(d));self.assertIsNone(damaged['same_boot']);self.assertIsNone(damaged['remaining_seconds']);self.assertIn('both backup copies invalid',damaged['integrity_error']);self.assertTrue(self.armed)
+ def test_unrelated_or_down_ipv4_path_refused_before_backup(self):
+  for scenario in ('down','unrelated'):
+   with self.subTest(scenario=scenario):
+    self.b['links'][0]['operstate']='DOWN' if scenario=='down' else 'UP'
+    self.b['routes4'][0]['dev']='other' if scenario=='unrelated' else 'eth.123'
+    with self.assertRaisesRegex(e.Stop,'IPv4'):self.apply()
+    self.assertFalse(e.p(e.STATE).exists());self.assertFalse(self.armed)
  def test_restore_exact_files_knobs(self):
   d=self.apply()
   with contextlib.redirect_stdout(io.StringIO()):e.restore(d)

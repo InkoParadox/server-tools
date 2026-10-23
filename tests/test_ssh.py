@@ -6,6 +6,14 @@ from test_chrony import load_engine,SCRIPT
 
 class InterfaceTests(unittest.TestCase):
     def setUp(self):self.launcher,self.engine,self.a=load_engine()
+    def test_host_context_rejects_container_and_accepts_full_vm(self):
+        a=self.a
+        with patch.object(a['shutil'],'which',return_value='/usr/bin/systemd-detect-virt'):
+            for code,name in ((0,'docker'),(0,'lxc'),(2,'')):
+                a['run']=lambda *args,**kw:subprocess.CompletedProcess(args,code,name,'')
+                with self.subTest(name=name),self.assertRaises(a['Stop']):a['host_context']()
+            a['run']=lambda *args,**kw:subprocess.CompletedProcess(args,1,'none\n','')
+            a['host_context']()
     def test_status_json_and_color_stderr(self):
         display=SCRIPT.parents[0]/'src/display.py'
         raw=json.dumps(dict(status='STOP',error_code='confirmation_expired',reason='same',remaining_seconds=42,watchdog_active=True))+'\n'
