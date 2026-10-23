@@ -9,7 +9,7 @@ def build():
     head="""#!/usr/bin/env bash
 set -euo pipefail
 export PYTHONUTF8=1
-[ "$(id -u)" -eq 0 ] || { printf '\\033[1;31mSTOP: root SSH required\\033[0m\\n' >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || { printf '\\033[1;31mSTOP: root required\\033[0m\\n' >&2; exit 1; }
 command -v python3 >/dev/null || { printf '\\033[1;31mSTOP: python3 required\\033[0m\\n' >&2; exit 1; }
 umask 077
 mist_ipv6_ui_dir=$(mktemp -d /root/mist-ipv6-xshell-XXXXXXXX)

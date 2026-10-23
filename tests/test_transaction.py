@@ -19,8 +19,6 @@ class Transaction(unittest.TestCase):
   def runtime():
    r=copy.deepcopy(self.rt);r['knobs']=e.knobs();return r
   self.patch('runtime',runtime)
-  self.patch('ssh_session',lambda **kw: {'tuple':os.environ['SSH_CONNECTION'].split(),'inode':os.environ['SSH_CONNECTION'].split()[1],'sshd_start_ticks':1 if os.environ['SSH_CONNECTION'].split()[1]=='40000' else 200,'boot_id':'boot'})
-  self.patch('connection_live',lambda proof:True);self.patch('boot_ticks',lambda:100)
   self.patch_sleep=patch.object(e.time,'sleep',lambda _:None);self.patch_sleep.start();self.addCleanup(self.patch_sleep.stop)
   self.patch('jr',lambda *a:copy.deepcopy(self.rt['links']))
   def arm(d,seconds):
@@ -48,10 +46,8 @@ class Transaction(unittest.TestCase):
  def apply(self):
   with contextlib.redirect_stdout(io.StringIO()):e.apply(60)
   return next(e.p(e.STATE).glob('tx-*'))
- def test_commit_new_ssh(self):
+ def test_commit_same_session(self):
   d=self.apply();self.assertTrue(self.armed)
-  with self.assertRaises(e.Stop):e.confirm(d)
-  os.environ['SSH_CONNECTION']='198.51.100.1 40001 192.0.2.2 22'
   with contextlib.redirect_stdout(io.StringIO()):e.confirm(d)
   self.assertFalse(self.armed);self.assertEqual(e.read_status(d)['status'],'committed')
  def test_restore_exact_files_knobs(self):
@@ -86,10 +82,15 @@ class Transaction(unittest.TestCase):
   d=self.apply();e.p('/etc/netplan/test.yaml').write_bytes(b'FOREIGN')
   with self.assertRaises(e.Stop):e.restore(d)
   self.assertEqual(e.p('/etc/netplan/test.yaml').read_bytes(),b'FOREIGN');self.assertTrue(self.armed)
- def test_wrong_endpoint_refused(self):
-  d=self.apply();os.environ['SSH_CONNECTION']='198.51.100.1 40001 192.0.2.3 22'
+ def test_stale_or_missing_ssh_environment_accepted(self):
+  d=self.apply();os.environ.pop('SSH_CONNECTION',None)
+  with contextlib.redirect_stdout(io.StringIO()):e.confirm(d)
+  self.assertEqual(e.read_status(d)['status'],'committed');self.assertFalse(self.armed)
+ def test_rolled_back_cannot_commit(self):
+  d=self.apply()
+  with contextlib.redirect_stdout(io.StringIO()):e.restore(d)
   with self.assertRaises(e.Stop):e.confirm(d)
-  self.assertTrue(self.armed)
+  self.assertEqual(e.read_status(d)['status'],'rolled_back');self.assertFalse(self.armed)
  def test_reboot_confirm_refused(self):
   d=self.apply();e.p('/proc/sys/kernel/random/boot_id').write_text('newboot');os.environ['SSH_CONNECTION']='198.51.100.1 40001 192.0.2.2 22'
   with self.assertRaises(e.Stop):e.confirm(d)

@@ -23,7 +23,7 @@ def main():
             say('  Сеть: ' + '; '.join(str(k) + ': ' + str(v) for k, v in value.items()), '36')
 
     if human:
-        say('\nMIST | IPv6 V2.2', '1;36')
+        say('\nMIST | IPv6 V2.3', '1;36')
         if os.environ.get('MIST_IPV6_VERIFIED_SHA'):
             say('[OK] Контрольная сумма исходника проверена', '32')
         if os.environ.get('MIST_IPV6_SAVED_SOURCE'):
@@ -52,7 +52,7 @@ def main():
         elif status == 'AWAITING_CONFIRMATION':
             say('[OK] IPv6 отключён. Локальные проверки пройдены.', '32')
             owners(item)
-            say('[ЖДЁТ] Нужна проверка из НОВОГО SSH-подключения.', '1;33')
+            say('[ЖДЁТ] Подтвердите результат до истечения страховки.', '1;33')
             seconds = item.get('seconds')
             if seconds is not None:
                 say('  Страховка: ' + str(seconds) + ' с осталось до автоотката.', '33')
@@ -61,19 +61,13 @@ def main():
             if transaction:
                 say('  Резервная копия: ' + str(transaction), '36')
             if isinstance(tool, str) and isinstance(transaction, str):
-                say('  Откройте новое IPv4 SSH-подключение к этому же серверу и порту.', '33')
-                say('  В нём выполните команду подтверждения:', '33')
+                say('  После проверки доступности выполните одну команду:', '33')
                 confirm = ('bash ' + shlex.quote(tool) + ' --confirm ' + shlex.quote(transaction)
                            + ' | python3 ' + shlex.quote(os.path.abspath(__file__)))
                 say('  bash -o pipefail -c ' + shlex.quote(confirm), '1;36')
             say('  Без подтверждения автоматический откат останется включён.', '33')
-        elif status == 'SSH_CLIENT_WAIT':
-            say('[ЖДЁТ] Нажмите Enter в окне tmux того клиента, через который выполняете операцию.', '1;33')
-            say('  Проверка фактического TCP обязательна; старое соединение не принимается.', '33')
-        elif status == 'SSH_IDENTITY':
-            say('[OK] Фактическое SSH-подключение установлено по данным ядра.', '1;32')
         elif status == 'COMMITTED':
-            say('[OK] Проверка через новое SSH пройдена. Автооткат отменён.', '1;32')
+            say('[OK] Результат подтверждён. Автооткат отменён.', '1;32')
             if item.get('transaction'):
                 say('  Резервная копия сохранена: ' + str(item['transaction']), '36')
         elif status == 'ROLLED_BACK':

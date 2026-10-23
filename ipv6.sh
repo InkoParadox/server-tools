@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export PYTHONUTF8=1
-[ "$(id -u)" -eq 0 ] || { printf '\033[1;31mSTOP: root SSH required\033[0m\n' >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || { printf '\033[1;31mSTOP: root required\033[0m\n' >&2; exit 1; }
 command -v python3 >/dev/null || { printf '\033[1;31mSTOP: python3 required\033[0m\n' >&2; exit 1; }
 umask 077
 mist_ipv6_ui_dir=$(mktemp -d /root/mist-ipv6-xshell-XXXXXXXX)
-cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_7DED30F3C6C5'
+cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_1D230A3B6D64'
 #!/usr/bin/env bash
 set -eu
 export PYTHONUTF8=1
@@ -14,10 +14,10 @@ command -v python3 >/dev/null || { echo "STOP: python3 required" >&2; exit 1; }
 exec python3 - "$@" <<'MIST_PYTHON'
 #!/usr/bin/env python3
 """MIST IPv6 host transaction. Embedded in the distributed Bash file. Python >=3.8."""
-import argparse,base64,copy,ctypes,errno,fcntl,socket,struct,collections,glob,hashlib,ipaddress,json,os,pathlib,re,shlex,shutil,signal,stat,subprocess,sys,tempfile,time,uuid,select,secrets
+import argparse,base64,copy,ctypes,errno,fcntl,socket,struct,collections,glob,hashlib,ipaddress,json,os,pathlib,re,shlex,shutil,signal,stat,subprocess,sys,tempfile,time,uuid
 need_python = sys.version_info >= (3,8)
 if not need_python:raise SystemExit('STOP: Python >=3.8 required; no package installed')
-VERSION='2.2'
+VERSION='2.3'
 APPLY_DEADLINE=None
 ROOT=pathlib.Path('/')
 STATE='/var/lib/mist-ipv6'
@@ -675,282 +675,11 @@ def verify_off(before):
     if before.get('dns_probe_ok',True):run(['getent','ahostsv4','example.com'],timeout=12)
     if before.get('chrony_ipv4_monitor'):chrony_ipv4_sources()
     return now
-# Connection attribution is deliberately independent of inherited SSH_CONNECTION.
-def connection_error(code, message, **details):
+def transaction_error(code, message, **details):
     error = Stop(message)
     error.details = dict(error_code=code, **details)
     raise error
 
-
-def boot_ticks():
-    return int(time.clock_gettime(time.CLOCK_BOOTTIME) * os.sysconf('SC_CLK_TCK'))
-
-
-def proc_info(pid):
-    root = p('/proc') / str(int(pid))
-    fields = (root / 'stat').read_text().rsplit(')', 1)[1].split()
-    executable = os.readlink(root / 'exe')
-    return {'pid': int(pid), 'ppid': int(fields[1]), 'start_ticks': int(fields[19]),
-            'exe': pathlib.Path(executable[:-10] if executable.endswith(' (deleted)') else executable).name,
-            'uid': (root / 'exe').stat().st_uid, 'euid': int(next(line for line in (root / 'status').read_text().splitlines() if line.startswith('Uid:')).split()[2]), 'mode': (root / 'exe').stat().st_mode}
-
-
-def ancestry(pid):
-    result = []
-    seen = set()
-    for _ in range(64):
-        if pid <= 1 or pid in seen:
-            return result
-        seen.add(pid)
-        row = proc_info(pid)
-        result.append(row)
-        pid = row['ppid']
-    raise Stop('process ancestry is incomplete or cyclic')
-
-
-def socket_inodes(pid):
-    result = set()
-    for fd in (p('/proc') / str(pid) / 'fd').iterdir():
-        try:
-            link = os.readlink(fd)
-        except FileNotFoundError:
-            continue
-        if re.fullmatch(r'socket:\[\d+\]', link):
-            result.add(link[8:-1])
-    return result
-
-
-def proc_endpoint(value, family):
-    address, port = value.split(':')
-    data = bytes.fromhex(address)
-    if family == socket.AF_INET:
-        data = data[::-1]
-    else:
-        data = b''.join(data[i:i+4][::-1] for i in range(0, 16, 4))
-    ip = ipaddress.ip_address(socket.inet_ntop(family, data))
-    if ip.version == 6 and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
-    return str(ip), str(int(port, 16))
-
-
-def tcp_sockets():
-    result = {}
-    for name, family in (('tcp', socket.AF_INET), ('tcp6', socket.AF_INET6)):
-        path = p('/proc/net') / name
-        if not path.exists():
-            continue
-        for line in path.read_text().splitlines()[1:]:
-            fields = line.split()
-            if len(fields) < 10 or fields[9] == '0':
-                continue
-            local = proc_endpoint(fields[1], family)
-            peer = proc_endpoint(fields[2], family)
-            result[fields[9]] = {'state': fields[3], 'tuple': [peer[0], peer[1], local[0], local[1]]}
-    return result
-
-
-def sshd_connection(chain):
-    sockets = tcp_sockets()
-    holders = {}
-    listen_ports = set()
-    for process in chain:
-        if process['exe'] not in ('sshd', 'sshd-session'):
-            continue
-        need(process['uid'] == 0 and not process['mode'] & 0o022, 'untrusted SSH daemon executable')
-        for inode in socket_inodes(process['pid']):
-            row = sockets.get(inode)
-            if row is None:
-                continue
-            if row['state'] == '0A':
-                listen_ports.add(row['tuple'][3])
-            elif row['state'] == '01':
-                holders.setdefault(inode, []).append(process)
-    candidates = [inode for inode in holders if not listen_ports or sockets[inode]['tuple'][3] in listen_ports]
-    if len(candidates) != 1:
-        connection_error('ssh_transport_unverified', 'cannot attribute exactly one accepted TCP socket to this SSH process ancestry', candidates=len(candidates))
-    inode = candidates[0]
-    process = min(holders[inode], key=lambda row: row['start_ticks'])
-    values = sockets[inode]['tuple']
-    client, server = ipaddress.ip_address(values[0]), ipaddress.ip_address(values[2])
-    need(client.version == server.version == 4 and not client.is_loopback and not server.is_loopback,
-         'authenticated external IPv4 SSH required')
-    proof = {'tuple': values, 'inode': inode, 'sshd_pid': process['pid'],
-             'sshd_start_ticks': process['start_ticks'],
-             'boot_id': p('/proc/sys/kernel/random/boot_id').read_text().strip(), 'source': 'sshd_ancestry'}
-    need(connection_live(proof), 'SSH transport disappeared during attribution')
-    return proof
-
-
-def tmux_clients(context):
-    template = '#{client_pid}|#{client_name}|#{pane_id}|#{client_readonly}'
-    rows = run(['tmux', '-S', context['socket'], 'list-clients', '-F', template]).stdout.splitlines()
-    result = []
-    for line in rows:
-        fields = line.split('|')
-        need(len(fields) == 4, 'unrecognised tmux client metadata')
-        pid, target, pane, readonly = fields
-        if pane != context['pane'] or readonly == '1':
-            continue
-        need(pid.isdecimal() and target, 'invalid tmux client identity')
-        process = proc_info(int(pid))
-        need(process['exe'] == 'tmux' and process['uid'] == process['euid'] == 0 and not process['mode'] & 0o022,
-             'tmux client is not a trusted root tmux process')
-        result.append({'pid': int(pid), 'target': target, 'start_ticks': process['start_ticks']})
-    return result
-
-
-def tmux_context(chain):
-    value = os.environ.get('TMUX', '')
-    if not value:
-        return None
-    try:
-        path, pid, _ = value.rsplit(',', 2)
-        pid = int(pid)
-    except ValueError:
-        connection_error('tmux_context_unverified', 'malformed tmux context; no SSH environment fallback is used')
-    server = next((row for row in chain if row['pid'] == pid), None)
-    if server is None:
-        # A stale environment value in a direct SSH shell is not authority.
-        return None
-    need(server['exe'] == 'tmux' and server['uid'] == server['euid'] == 0 and not server['mode'] & 0o022,
-         'root tmux process required for client-bound attribution')
-    sock = pathlib.Path(path)
-    st = sock.stat()
-    need(stat.S_ISSOCK(st.st_mode) and st.st_uid == 0 and not sock.parent.is_symlink() and sock.parent.stat().st_uid == 0 and not sock.parent.stat().st_mode & 0o077,
-         'unsafe tmux server socket directory')
-    unix = {}
-    for line in p('/proc/net/unix').read_text().splitlines()[1:]:
-        fields = line.split(maxsplit=7)
-        if len(fields) == 8:
-            unix[fields[6]] = fields[7]
-    need(any(unix.get(inode) == path for inode in socket_inodes(pid)),
-         'tmux socket is not owned by the ancestor tmux server')
-    rows = run(['tmux', '-S', path, 'list-panes', '-a', '-F', '#{pane_id}|#{pane_pid}']).stdout.splitlines()
-    ancestors = {row['pid'] for row in chain}
-    panes = [line.split('|')[0] for line in rows if len(line.split('|')) == 2 and line.split('|')[1].isdigit() and int(line.split('|')[1]) in ancestors]
-    need(len(panes) == 1 and panes[0] == os.environ.get('TMUX_PANE'),
-         'caller cannot be bound to exactly one tmux pane')
-    return {'socket': path, 'server_pid': pid, 'server_start_ticks': server['start_ticks'], 'pane': panes[0]}
-
-
-def connection_live(proof):
-    try:
-        if proof['boot_id'] != p('/proc/sys/kernel/random/boot_id').read_text().strip():
-            return False
-        process = proc_info(proof['sshd_pid'])
-        if process['start_ticks'] != proof['sshd_start_ticks'] or process['exe'] not in ('sshd', 'sshd-session'):
-            return False
-        row = tcp_sockets().get(proof['inode'])
-        if row is None or row['state'] != '01' or row['tuple'] != proof['tuple'] or proof['inode'] not in socket_inodes(proof['sshd_pid']):
-            return False
-        if 'tmux' in proof:
-            context = proof['tmux']
-            server = proc_info(context['server_pid'])
-            if server['start_ticks'] != context['server_start_ticks']:
-                return False
-            clients = tmux_clients(context)
-            if not any(c['pid'] == context['client_pid'] and c['start_ticks'] == context['client_start_ticks'] for c in clients):
-                return False
-        return True
-    except (OSError, ValueError, KeyError, Stop):
-        return False
-
-
-def tmux_ack(args):
-    # Internal popup callback. It never changes network state or confirms a tx.
-    path, token, client_pid, seconds = args
-    target = pathlib.Path(path)
-    need(target.parent.parent == pathlib.Path('/run') and target.parent.name.startswith('mist-ssh-'), 'invalid acknowledgement socket path')
-    st = target.parent.stat()
-    need(st.st_uid == 0 and not st.st_mode & 0o077 and stat.S_ISSOCK(target.stat().st_mode), 'unsafe acknowledgement socket')
-    need(re.fullmatch('[a-f0-9]{64}', token) and client_pid.isdecimal(), 'invalid acknowledgement nonce')
-    limit = time.monotonic() + min(25, max(0, float(seconds)))
-    with open('/dev/tty', 'w') as output, open('/dev/tty', 'r') as tty:
-        output.write('\033[1;33mIPv6: привязка к этому SSH-подключению\033[0m\nНажмите Enter здесь. Это не отменяет проверки и автооткат.\n')
-        output.flush()
-        while target.exists() and time.monotonic() < limit:
-            ready, _, _ = select.select([tty], [], [], min(.2, max(0, limit-time.monotonic())))
-            if ready:
-                line = tty.readline()
-                if line not in ('\n', '\r\n'):
-                    return
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
-                    channel.settimeout(2)
-                    channel.connect(path)
-                    channel.sendall(canonical({'nonce': token, 'client_pid': int(client_pid)}) + b'\n')
-                return
-
-
-def tmux_connection(context, timeout):
-    clients = tmux_clients(context)
-    if not clients:
-        connection_error('tmux_no_client', 'no writable attached client is viewing this tmux pane; inherited SSH_CONNECTION is not a transport proof')
-    tool = pathlib.Path(os.environ['MIST_IPV6_SELF'])
-    need(tool.stat().st_uid == 0 and not tool.stat().st_mode & 0o022, 'unsafe popup callback source')
-    timeout = min(20, timeout)
-    need(timeout > 1, 'not enough time remains for a client-bound tmux acknowledgement')
-    with tempfile.TemporaryDirectory(prefix='mist-ssh-', dir='/run') as folder:
-        path = str(pathlib.Path(folder) / 'ack.sock')
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
-            server.bind(path)
-            server.listen(len(clients))
-            tokens = {secrets.token_hex(32): client for client in clients}
-            deadline = time.monotonic() + timeout
-            invokers = []
-            try:
-                for token, client in tokens.items():
-                    command = shlex.join(['bash', str(tool), '--_tmux-ack', path, token, str(client['pid']), str(timeout)])
-                    invokers.append(subprocess.Popen(['tmux', '-S', context['socket'], 'display-popup', '-E', '-c', client['target'], '-w', '76', '-h', '8', command], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True))
-                emit(status='SSH_CLIENT_WAIT', seconds=timeout, clients=len(invokers))
-                while time.monotonic() < deadline:
-                    server.settimeout(max(.05, deadline-time.monotonic()))
-                    try:
-                        channel, _ = server.accept()
-                    except socket.timeout:
-                        break
-                    with channel:
-                        peer_pid, uid, _ = struct.unpack('3i', channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
-                        need(uid == 0 and context['server_pid'] in {row['pid'] for row in ancestry(peer_pid)}, 'acknowledgement did not come from the tmux popup process')
-                        channel.settimeout(2)
-                        data = b''
-                        while not data.endswith(b'\n') and len(data) <= 4096:
-                            part = channel.recv(4097-len(data))
-                            if not part:
-                                break
-                            data += part
-                        need(data.endswith(b'\n') and len(data) <= 4096, 'invalid acknowledgement framing')
-                        message = json.loads(data)
-                        client = tokens.get(message.get('nonce'))
-                        need(client and message.get('client_pid') == client['pid'], 'acknowledgement nonce/client mismatch')
-                        active_clients = tmux_clients(context)
-                        need(client in active_clients, 'acknowledging tmux client detached or changed pane')
-                        proof = sshd_connection(ancestry(client['pid']))
-                        proof['source'] = 'tmux_client_ack'
-                        proof['tmux'] = dict(context, client_pid=client['pid'], client_start_ticks=client['start_ticks'])
-                        pathlib.Path(path).unlink()
-                        return proof
-            finally:
-                pathlib.Path(path).unlink(missing_ok=True)
-                limit=time.monotonic()+2
-                for proc in invokers:
-                    try:proc.wait(timeout=max(.01,limit-time.monotonic()))
-                    except subprocess.TimeoutExpired:
-                        proc.terminate()
-                        try:proc.wait(timeout=.5)
-                        except subprocess.TimeoutExpired:proc.kill();proc.wait()
-    connection_error('tmux_ack_timeout', 'no tmux client acknowledged this SSH connection before the timeout; watchdog remains unchanged')
-
-
-def ssh_session(timeout=20):
-    need(os.stat('/proc/self/ns/net').st_ino == os.stat('/proc/1/ns/net').st_ino,
-         'run in the host PID 1 network namespace')
-    chain = ancestry(os.getpid())
-    context = tmux_context(chain)
-    proof = tmux_connection(context, timeout) if context else sshd_connection(chain)
-    addresses = {a['local'] for row in jr('ip', '-j', '-4', 'addr') for a in row.get('addr_info', [])}
-    need(proof['tuple'][0] not in addresses, 'SSH peer is a local host address; an external client is required')
-    proof['environment_ignored'] = os.environ.get('SSH_CONNECTION', '').split() != proof['tuple']
-    return proof
 
 def tcp_peers(text):
     peers=[]
@@ -1194,7 +923,7 @@ def load(d):
     for name in ('backup','backup-mirror'):
         try:
             b=(d/(name+'.json')).read_bytes();expected=(d/(name+'.sha256')).read_text().strip();need(sha(b)==expected,'backup digest mismatch')
-            s=json.loads(b);need(s['version'] in ('2.1',VERSION),'backup version mismatch')
+            s=json.loads(b);need(s['version'] in ('2.1','2.2',VERSION),'backup version mismatch')
             need(s['machine']==p('/etc/machine-id').read_text().strip(),'backup belongs to a different machine')
             need(sha((d/'tool.sh').read_bytes())==s['tool_sha'],'backup tool digest mismatch')
             for path,r in s['files'].items():
@@ -1370,11 +1099,10 @@ def pending():
     return [d for d in p(STATE).glob('tx-*') if d.is_dir() and read_status(d)['status'] not in ('committed','rolled_back','prepared_failed')]
 def apply(seconds):
     global APPLY_DEADLINE
-    need(not pending(),'unfinished transaction exists; use --status/--restore');transport=ssh_session();session=transport['tuple']
+    need(not pending(),'unfinished transaction exists; use --status/--restore')
     pl,before=discover();validate_plan(pl)
     if not pl.changes and all(x.get('disable_ipv6')==1 for x in before['knobs'].values()) and not addr_set(before['addr6'],'inet6') and not before['routes6']:
         emit(status='NOOP',owners=pl.owners);return
-    need(any(a['local']==session[2] for x in before['addr4'] for a in x.get('addr_info',[])),'SSH server address is not on this host')
     created_dirs=set()
     for path in pl.changes:
         parent=p(path).parent
@@ -1388,7 +1116,7 @@ def apply(seconds):
     try:
         status_write(d,'prepared_failed') # no network writes until backup is complete and armed
         atomic(d/'tool.sh',b,0o700)
-        s={'version':VERSION,'machine':p('/etc/machine-id').read_text().strip(),'boot':p('/proc/sys/kernel/random/boot_id').read_text().strip(),'ssh':session,'transport':transport,'before':before,
+        s={'version':VERSION,'machine':p('/etc/machine-id').read_text().strip(),'boot':p('/proc/sys/kernel/random/boot_id').read_text().strip(),'before':before,
            'created_dirs':sorted(created_dirs,key=len,reverse=True),'files':{path:pl.watched[path] for path in pl.changes},'after':pl.changes,'actions':pl.actions,'watched':{path:{k:v for k,v in rec.items() if k!='data' or path in pl.changes} for path,rec in pl.watched.items()},'inventory':pl.inventory,'owners':pl.owners,'tool_sha':sha(b)}
         save_backup(d,s)
         load(d);status_write(d,'prepared')
@@ -1397,7 +1125,7 @@ def apply(seconds):
     armed=False;mutated=False
     try:
         deadline=time.monotonic()+seconds
-        need(connection_live(transport),'applying SSH transport disconnected before arming');arm(d,seconds);armed=True;race_check(pl);APPLY_DEADLINE=deadline
+        arm(d,seconds);armed=True;race_check(pl);APPLY_DEADLINE=deadline
         status_write(d,'applying')
         for path,r in pl.changes.items():
             need(matches(path,pl.watched[path]),'concurrent modification before write: '+path)
@@ -1421,8 +1149,8 @@ def apply(seconds):
         need(set(pl.watch_globs())==set(pl.inventory)|set(pl.changes),'configuration file set changed during apply')
         for path,r in pl.watched.items():need(matches(path,pl.changes.get(path,r)),'concurrent write during apply: '+path)
         APPLY_DEADLINE=None
-        status_write(d,'awaiting_confirmation',deadline_monotonic=deadline,confirmation_ready_ticks=boot_ticks(),boot=s['boot'],ipv4_policy_reinstated=restored_rules4)
-        emit(status='AWAITING_CONFIRMATION',transaction=str(d),tool=str(d/'tool.sh'),machine=s['machine'],owners=pl.owners,seconds=max(0,int(deadline-time.monotonic())),watchdog_active=True,transport=transport,ipv4_policy_reinstated=restored_rules4)
+        status_write(d,'awaiting_confirmation',deadline_monotonic=deadline,boot=s['boot'],ipv4_policy_reinstated=restored_rules4)
+        emit(status='AWAITING_CONFIRMATION',transaction=str(d),tool=str(d/'tool.sh'),machine=s['machine'],owners=pl.owners,seconds=max(0,int(deadline-time.monotonic())),watchdog_active=True,ipv4_policy_reinstated=restored_rules4)
     except BaseException as original:
         APPLY_DEADLINE=None
         atomic(d/'apply-error.txt',str(original).encode())
@@ -1446,52 +1174,32 @@ def transaction_view(d):
 def confirmation_state(d,s):
     view=transaction_view(d)
     if view['status']!='awaiting_confirmation':
-        connection_error('not_awaiting_confirmation','transaction is '+view['status']+'; no confirmation performed',**view)
+        transaction_error('not_awaiting_confirmation','transaction is '+view['status']+'; no confirmation performed',**view)
     if s['boot']!=p('/proc/sys/kernel/random/boot_id').read_text().strip():
-        connection_error('server_rebooted','server rebooted before confirmation; restore required',**view)
+        transaction_error('server_rebooted','server rebooted before confirmation; restore required',**view)
     if time.monotonic()>=view.get('deadline_monotonic',0):
-        connection_error('confirmation_expired','confirmation deadline elapsed; watchdog remains armed',**view)
+        transaction_error('confirmation_expired','confirmation deadline elapsed; watchdog remains armed',**view)
     if not view['watchdog_active']:
-        connection_error('watchdog_inactive','rollback watchdog is not active; confirmation refused',**view)
+        transaction_error('watchdog_inactive','rollback watchdog is not active; confirmation refused',**view)
     return view
-
-def validate_confirmation_transport(s,view,transport):
-    old=s.get('transport')
-    if not old or not view.get('confirmation_ready_ticks'):
-        connection_error('legacy_transport_unproven','legacy transaction has no kernel transport proof; restore with its saved tool before a new apply',**view)
-    session=transport['tuple']
-    if session[2:]!=s['ssh'][2:]:
-        connection_error('ssh_endpoint_changed','SSH server address or port changed; reconnect to the applying endpoint',expected_endpoint=s['ssh'][2:],actual_endpoint=session[2:],**view)
-    if session==s['ssh'] or (transport['boot_id']==old['boot_id'] and transport['inode']==old['inode']):
-        connection_error('ssh_same_transport','same SSH TCP transport; open a new connection with multiplexing/reuse disabled',**view)
-    if transport['sshd_start_ticks']<=view['confirmation_ready_ticks']:
-        connection_error('ssh_transport_predates_apply','this SSH TCP transport existed before AWAITING_CONFIRMATION; open another new connection',**view)
-    if not connection_live(transport):
-        connection_error('ssh_transport_lost','confirming SSH transport disconnected; watchdog remains armed',**view)
 
 def confirm(d):
     d,s=load(d);view=confirmation_state(d,s)
-    # Reject legacy transactions and expired operations before any tmux prompt.
-    if not s.get('transport') or not view.get('confirmation_ready_ticks'):
-        connection_error('legacy_transport_unproven','legacy transaction has no kernel transport proof; restore with its saved tool before a new apply',**view)
-    transport=ssh_session(timeout=min(20,max(0,view['deadline_monotonic']-time.monotonic()-2)))
-    view=confirmation_state(d,s);validate_confirmation_transport(s,view,transport)
     verify_off(s['before'])
     pl=Plan();pl.watched=s['watched'];pl.netplan_before={} if any(v.startswith('netplan/') for v in s['owners'].values()) else None
     have=set(pl.watch_globs());want=set(s['inventory'])|set(s['after'])
     need(have==want,'configuration file set changed before confirmation; missing='+str(sorted(want-have))+' added='+str(sorted(have-want)))
     for path,r in s['watched'].items():need(matches(path,s['after'].get(path,r)),'configuration changed before confirmation: '+path)
-    view=confirmation_state(d,s);validate_confirmation_transport(s,view,transport)
-    status_write(d,'committed',ssh=transport['tuple'],transport=transport);disarm(d);emit(status='COMMITTED',transaction=str(d),transport=transport,watchdog_active=False)
+    confirmation_state(d,s)
+    status_write(d,'committed');disarm(d);emit(status='COMMITTED',transaction=str(d),watchdog_active=False)
 
 def main():
     ap=argparse.ArgumentParser(description='Transactional host IPv6 disable. Default: read-only check.')
-    g=ap.add_mutually_exclusive_group();g.add_argument('--check',action='store_true');g.add_argument('--apply',action='store_true');g.add_argument('--status',action='store_true');g.add_argument('--confirm');g.add_argument('--restore');g.add_argument('--automatic-restore');g.add_argument('--connection',action='store_true');g.add_argument('--_tmux-ack',nargs=4,help=argparse.SUPPRESS)
-    ap.add_argument('--rollback-seconds',type=int,default=240)
+    g=ap.add_mutually_exclusive_group();g.add_argument('--check',action='store_true');g.add_argument('--apply',action='store_true');g.add_argument('--status',action='store_true');g.add_argument('--confirm');g.add_argument('--restore');g.add_argument('--automatic-restore')
+    ap.add_argument('--rollback-seconds',type=int,default=600)
     a=ap.parse_args();need(os.geteuid()==0,'root required');need(60<=a.rollback_seconds<=1800,'rollback timeout must be 60..1800 seconds')
     for sig in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP):signal.signal(sig,lambda n,f:(_ for _ in ()).throw(Stop('interrupted by signal '+str(n))))
-    if a._tmux_ack:tmux_ack(a._tmux_ack);return
-    if a.connection:emit(status='SSH_IDENTITY',transport=ssh_session());return
+    need(os.stat('/proc/self/ns/net').st_ino == os.stat('/proc/1/ns/net').st_ino, 'run in the host PID 1 network namespace')
     p('/run/lock').mkdir(exist_ok=True)
     fd=os.open(p('/run/lock/mist-ipv6.lock'),os.O_RDWR|os.O_CREAT|getattr(os,'O_NOFOLLOW',0),0o600)
     st=os.fstat(fd);need(stat.S_ISREG(st.st_mode) and st.st_uid==0 and not st.st_mode&0o022,'unsafe transaction lock file')
@@ -1508,8 +1216,8 @@ if __name__=='__main__':
     try:main()
     except Exception as e:emit(**dict(getattr(e,'details',{}),status='STOP',reason=str(e)));sys.exit(1)
 MIST_PYTHON
-MIST_ENGINE_EXACT_7DED30F3C6C5
-printf '%s  %s\n' '7ded30f3c6c5b293d12f9aa4c9427c074f119b1abe90b9f6202d1eef2f83e424' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
+MIST_ENGINE_EXACT_1D230A3B6D64
+printf '%s  %s\n' '1d230a3b6d647fb798ecdda7d1b9f7663ee85bf8d56b961c3f3cf84331ecf0c1' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
 chmod 700 "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 cat > "$mist_ipv6_ui_dir/display.py" <<'MIST_XSHELL_DISPLAY_EOF'
 #!/usr/bin/env python3
@@ -1537,7 +1245,7 @@ def main():
             say('  Сеть: ' + '; '.join(str(k) + ': ' + str(v) for k, v in value.items()), '36')
 
     if human:
-        say('\nMIST | IPv6 V2.2', '1;36')
+        say('\nMIST | IPv6 V2.3', '1;36')
         if os.environ.get('MIST_IPV6_VERIFIED_SHA'):
             say('[OK] Контрольная сумма исходника проверена', '32')
         if os.environ.get('MIST_IPV6_SAVED_SOURCE'):
@@ -1566,7 +1274,7 @@ def main():
         elif status == 'AWAITING_CONFIRMATION':
             say('[OK] IPv6 отключён. Локальные проверки пройдены.', '32')
             owners(item)
-            say('[ЖДЁТ] Нужна проверка из НОВОГО SSH-подключения.', '1;33')
+            say('[ЖДЁТ] Подтвердите результат до истечения страховки.', '1;33')
             seconds = item.get('seconds')
             if seconds is not None:
                 say('  Страховка: ' + str(seconds) + ' с осталось до автоотката.', '33')
@@ -1575,19 +1283,13 @@ def main():
             if transaction:
                 say('  Резервная копия: ' + str(transaction), '36')
             if isinstance(tool, str) and isinstance(transaction, str):
-                say('  Откройте новое IPv4 SSH-подключение к этому же серверу и порту.', '33')
-                say('  В нём выполните команду подтверждения:', '33')
+                say('  После проверки доступности выполните одну команду:', '33')
                 confirm = ('bash ' + shlex.quote(tool) + ' --confirm ' + shlex.quote(transaction)
                            + ' | python3 ' + shlex.quote(os.path.abspath(__file__)))
                 say('  bash -o pipefail -c ' + shlex.quote(confirm), '1;36')
             say('  Без подтверждения автоматический откат останется включён.', '33')
-        elif status == 'SSH_CLIENT_WAIT':
-            say('[ЖДЁТ] Нажмите Enter в окне tmux того клиента, через который выполняете операцию.', '1;33')
-            say('  Проверка фактического TCP обязательна; старое соединение не принимается.', '33')
-        elif status == 'SSH_IDENTITY':
-            say('[OK] Фактическое SSH-подключение установлено по данным ядра.', '1;32')
         elif status == 'COMMITTED':
-            say('[OK] Проверка через новое SSH пройдена. Автооткат отменён.', '1;32')
+            say('[OK] Результат подтверждён. Автооткат отменён.', '1;32')
             if item.get('transaction'):
                 say('  Резервная копия сохранена: ' + str(item['transaction']), '36')
         elif status == 'ROLLED_BACK':
@@ -1633,7 +1335,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         raise SystemExit(130)
 MIST_XSHELL_DISPLAY_EOF
-export MIST_IPV6_VERIFIED_SHA=7ded30f3c6c5b293d12f9aa4c9427c074f119b1abe90b9f6202d1eef2f83e424
+export MIST_IPV6_VERIFIED_SHA=1d230a3b6d647fb798ecdda7d1b9f7663ee85bf8d56b961c3f3cf84331ecf0c1
 export MIST_IPV6_SAVED_SOURCE="$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 [ "$#" -gt 0 ] || set -- --apply
 bash "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" "$@" | python3 "$mist_ipv6_ui_dir/display.py"

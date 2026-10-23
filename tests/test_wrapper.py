@@ -28,14 +28,12 @@ class WrapperTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'server reported ROLLED_BACK'):self.m.main()
             self.assertIn(b'ROLLED_BACK',out.buffer.getvalue())
         self.assertTrue(process.finished);self.assertFalse(process.terminated);self.assertEqual(process.timeouts,[None]);self.assertEqual(len(self.calls),1)
-    def test_long_preflight_and_confirmation_cleanup_keep_fresh_tcp(self):
+    def test_apply_waits_and_never_auto_confirms(self):
         apply=Process(700,[dict(status='AWAITING_CONFIRMATION',transaction=self.tx,tool=self.tx+'/tool.sh',seconds=240)])
-        confirm=Process(260,[dict(status='COMMITTED',transaction=self.tx)])
-        with self.execution([apply,confirm]):self.m.main()
-        self.assertEqual(len(self.calls),2)
-        for argv in self.calls:
-            for option in ('ControlMaster=no','ControlPath=none','StrictHostKeyChecking=yes','ServerAliveInterval=15','ServerAliveCountMax=3'):self.assertIn(option,argv)
-        self.assertTrue(apply.finished and confirm.finished);self.assertFalse(apply.terminated or confirm.terminated);self.assertEqual(apply.timeouts+confirm.timeouts,[None,None])
+        with self.execution([apply]):self.m.main()
+        self.assertEqual(len(self.calls),1);self.assertTrue(apply.finished);self.assertFalse(apply.terminated)
+        self.assertEqual(apply.timeouts,[None])
+        self.assertNotIn('ControlMaster=no',self.calls[0]);self.assertNotIn('ControlPath=none',self.calls[0])
     def test_real_transport_error_does_not_attempt_confirmation(self):
         process=Process(45,[],255)
         with self.execution([process]):

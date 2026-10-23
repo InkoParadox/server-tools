@@ -233,7 +233,7 @@ class ChronyTests(unittest.TestCase):
         digest = hashlib.sha256(self.engine).hexdigest().encode()
         self.assertEqual(self.launcher.count(digest), 2)
         subprocess.run(['bash', '-n'], input=self.launcher, check=True)
-        self.assertEqual(self.api['VERSION'], '2.2')
+        self.assertEqual(self.api['VERSION'], '2.3')
 
     def test_noop_repeated_run_still_requires_no_network_writes(self):
         self.before.update(knobs={'lo': {'disable_ipv6': 1}}, addr6=[], routes6=[])
