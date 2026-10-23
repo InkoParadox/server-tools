@@ -1083,12 +1083,23 @@ def restore(d,automatic=False):
 
 def pending():
     return [d for d in p(STATE).glob('tx-*') if d.is_dir() and read_status(d)['status'] not in ('committed','rolled_back','prepared_failed')]
+def require_ipv4(before):
+    addresses = [ipaddress.ip_address(a['local']) for row in before.get('addr4', [])
+                 for a in row.get('addr_info', []) if a.get('family') == 'inet']
+    need(any(not (a.is_loopback or a.is_link_local or a.is_unspecified or a.is_multicast) for a in addresses),
+         'no usable non-loopback IPv4 address; IPv6 may be the only host connectivity')
+    routes = [r for r in before.get('routes4', []) if r.get('type', 'unicast') == 'unicast' and r.get('dst') == 'default']
+    need(any(r.get('dev') not in (None, 'lo') or any(n.get('dev') not in (None, 'lo') for n in r.get('nexthops', [])) for r in routes),
+         'no usable IPv4 default route; refusing to remove possible IPv6-only connectivity')
+
+
 def apply(seconds):
     global APPLY_DEADLINE
     need(not pending(),'unfinished transaction exists; use --status/--restore')
     pl,before=discover();validate_plan(pl)
     if not pl.changes and all(x.get('disable_ipv6')==1 for x in before['knobs'].values()) and not addr_set(before['addr6'],'inet6') and not before['routes6']:
         emit(status='NOOP',owners=pl.owners);return
+    require_ipv4(before)
     created_dirs=set()
     for path in pl.changes:
         parent=p(path).parent
@@ -1152,7 +1163,10 @@ def transaction_view(d):
     value=dict(transaction=str(d),**read_status(d))
     if value['status']=='awaiting_confirmation':
         boot=p('/proc/sys/kernel/random/boot_id').read_text().strip()
-        value['same_boot']=value.get('boot')==boot
+        saved_boot=value.get('boot')
+        if saved_boot is None:
+            _,backup=load(d);saved_boot=backup['boot']
+        value['same_boot']=saved_boot==boot
         value['remaining_seconds']=max(0,int(value.get('deadline_monotonic',0)-time.monotonic())) if value['same_boot'] else 0
         value['watchdog_active']=active(unit_paths(d)[0]+'.timer')
     return value
@@ -1171,7 +1185,7 @@ def confirmation_state(d,s):
 
 def confirm(d):
     d,s=load(d);view=confirmation_state(d,s)
-    verify_off(s['before'])
+    require_ipv4(s['before']);verify_off(s['before'])
     pl=Plan();pl.watched=s['watched'];pl.netplan_before={} if any(v.startswith('netplan/') for v in s['owners'].values()) else None
     have=set(pl.watch_globs());want=set(s['inventory'])|set(s['after'])
     need(have==want,'configuration file set changed before confirmation; missing='+str(sorted(want-have))+' added='+str(sorted(have-want)))
@@ -1197,7 +1211,9 @@ def main():
         elif a.status:emit(status='STATUS',transactions=[transaction_view(d) for d in sorted(p(STATE).glob('tx-*')) if d.is_dir()])
         elif a.apply:apply(a.rollback_seconds)
         else:
-            pl,before=discover();validate_plan(pl);emit(status='CHECK_OK',version=VERSION,owners=pl.owners,changes=sorted(pl.changes),actions=pl.actions,ipv6_disabled=all(x.get('disable_ipv6')==1 for x in before['knobs'].values()))
+            pl,before=discover();validate_plan(pl)
+            if pl.changes or not all(x.get('disable_ipv6')==1 for x in before['knobs'].values()) or addr_set(before['addr6'],'inet6') or before['routes6']:require_ipv4(before)
+            emit(status='CHECK_OK',version=VERSION,owners=pl.owners,changes=sorted(pl.changes),actions=pl.actions,ipv6_disabled=all(x.get('disable_ipv6')==1 for x in before['knobs'].values()))
 if __name__=='__main__':
     try:main()
     except Exception as e:emit(**dict(getattr(e,'details',{}),status='STOP',reason=str(e)));sys.exit(1)

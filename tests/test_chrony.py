@@ -250,7 +250,7 @@ class ChronyTests(unittest.TestCase):
     def test_monitor_failure_after_apply_enters_existing_restore_path(self):
         self.dependencies()
         self.before.update(knobs={'lo': {'disable_ipv6': 0}}, addr6=[], routes6=[],
-                           addr4=[{'addr_info': [{'local': '203.0.113.2'}]}], dns_probe_ok=False)
+                           addr4=[{'addr_info': [{'family':'inet','local': '203.0.113.2'}]}], routes4=[{'dst':'default','dev':'eth0'}], dns_probe_ok=False)
         for name, value in (('etc/machine-id', 'test-machine'), ('proc/sys/kernel/random/boot_id', 'test-boot')):
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -287,6 +287,7 @@ class ChronyTests(unittest.TestCase):
         boot.parent.mkdir(parents=True)
         boot.write_text('test-boot')
         self.prepare_postcheck()
+        self.before.update(addr4=[{'addr_info':[{'family':'inet','local':'203.0.113.2'}]}],routes4=[{'dst':'default','dev':'eth0'}])
         self.csv = source(state='?')
         disarmed, states = [], []
         self.api.update(load=lambda d: (Path(d), {'ssh': ['203.0.113.1', '50000', '203.0.113.2', '22'],

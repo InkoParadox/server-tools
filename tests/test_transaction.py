@@ -50,6 +50,17 @@ class Transaction(unittest.TestCase):
   d=self.apply();self.assertTrue(self.armed)
   with contextlib.redirect_stdout(io.StringIO()):e.confirm(d)
   self.assertFalse(self.armed);self.assertEqual(e.read_status(d)['status'],'committed')
+ def test_ipv6_only_refused_before_backup(self):
+  self.b['addr4']=self.rt['addr4']=[];self.b['routes4']=self.rt['routes4']=[]
+  with self.assertRaisesRegex(e.Stop,'IPv4'):self.apply()
+  self.assertFalse(e.p(e.POLICY).exists());self.assertFalse(e.p(e.STATE).exists());self.assertFalse(self.armed)
+ def test_missing_ipv4_default_refused_before_backup(self):
+  self.b['routes4']=self.rt['routes4']=[]
+  with self.assertRaisesRegex(e.Stop,'IPv4'):self.apply()
+  self.assertFalse(e.p(e.POLICY).exists());self.assertFalse(e.p(e.STATE).exists());self.assertFalse(self.armed)
+ def test_legacy_status_boot_falls_back_to_backup(self):
+  d=self.apply();e.status_write(d,'awaiting_confirmation',deadline_monotonic=e.time.monotonic()+60)
+  view=e.transaction_view(d);self.assertTrue(view['same_boot']);self.assertGreater(view['remaining_seconds'],0)
  def test_restore_exact_files_knobs(self):
   d=self.apply()
   with contextlib.redirect_stdout(io.StringIO()):e.restore(d)
