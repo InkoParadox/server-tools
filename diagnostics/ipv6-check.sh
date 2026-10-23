@@ -7,7 +7,7 @@ main() {
   for key in sysctl ip; do command -v "$key" >/dev/null || { printf '\033[31mСТОП: нет %s\033[0m\n' "$key"; return 1; }; done
   links=$(ip -o link show) || { printf '\033[31mСТОП: интерфейсы не прочитаны\033[0m\n'; return 1; }
   for key in all default lo $(printf '%s\n' "$links" | awk -F': ' '{print $2}' | cut -d@ -f1); do
-    value=$(sysctl -n "net.ipv6.conf.${key}.disable_ipv6" 2>/dev/null) || value=unknown
+    value=$(sysctl -n "net/ipv6/conf/${key}/disable_ipv6" 2>/dev/null) || value=unknown
     printf 'disable_ipv6[%s]=%s\n' "$key" "$value"
     [[ $value == 1 ]] || bad=$((bad+1))
   done
