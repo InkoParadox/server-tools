@@ -38,6 +38,10 @@ class SSHTests(unittest.TestCase):
         env=dict(os.environ,MIST_IPV6_UI='stderr',TERM='xterm');env.pop('NO_COLOR',None)
         p=subprocess.run([sys.executable,str(display)],input=raw,text=True,capture_output=True,env=env)
         self.assertEqual(p.stdout,raw);self.assertIn('\033[1;31m',p.stderr);self.assertIn('42',p.stderr);self.assertIn('ssh_same_transport',p.stderr)
+    def test_reboot_status_does_not_mislabel_confirmation_window(self):
+        raw=json.dumps(dict(status='STATUS',transactions=[dict(status='awaiting_confirmation',same_boot=False,remaining_seconds=0,watchdog_active=True)]))+'\n'
+        p=subprocess.run([sys.executable,str(SCRIPT.parent/'src/display.py')],input=raw,text=True,encoding='utf-8',capture_output=True,env=dict(os.environ,MIST_IPV6_UI='stderr',TERM='xterm'))
+        self.assertEqual(p.stdout,raw);self.assertIn('подтверждение закрыто',p.stderr);self.assertNotIn('До автоотката: 0',p.stderr)
     def test_generated_engine_matches_readable_source(self):
         code=self.engine.split(b"<<'MIST_PYTHON'\n",1)[1].rsplit(b'\nMIST_PYTHON',1)[0]
         self.assertEqual(code.replace(b'\r\n',b'\n').rstrip(),(SCRIPT.parent/'src/engine.py').read_bytes().rstrip())

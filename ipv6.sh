@@ -1609,7 +1609,9 @@ def main():
             say('  Причина: ' + str(item.get('reason', 'не указана')), '31')
             if item.get('error_code'):
                 say('  Код: ' + str(item['error_code']), '31')
-            if 'remaining_seconds' in item:
+            if item.get('same_boot') is False:
+                say('  Сервер перезагружен: подтверждение закрыто; страховка: ' + str(item.get('watchdog_active')), '33')
+            elif 'remaining_seconds' in item:
                 say('  До автоотката: ' + str(item['remaining_seconds']) + ' с; страховка: ' + str(item.get('watchdog_active')), '33')
         elif status == 'STATUS':
             say('[ИНФО] Состояние сохранённых операций', '1;36')
@@ -1617,7 +1619,9 @@ def main():
                 state = tx.get('status', 'unknown')
                 tone = '32' if state == 'committed' else '31' if state == 'restore_failed' else '33'
                 say('  ' + str(tx.get('transaction', '')) + ': ' + str(state), tone)
-                if 'remaining_seconds' in tx:
+                if tx.get('same_boot') is False:
+                    say('    Сервер перезагружен: подтверждение закрыто; страховка: ' + str(tx.get('watchdog_active')), '33')
+                elif 'remaining_seconds' in tx:
                     say('    До автоотката: ' + str(tx['remaining_seconds']) + ' с; страховка: ' + str(tx.get('watchdog_active')), '33')
         else:
             say('[ИНФО] ' + json.dumps(item, ensure_ascii=False), '36')

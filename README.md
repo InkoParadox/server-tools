@@ -43,7 +43,7 @@ IPv4, маршруты, DNS, MTU и остальные параметры сох
 | Netplan/networkd + cloud-init, DHCP4, resolved | Настоящая Ubuntu VM: apply, новый SSH с ПК, COMMITTED, NOOP, restore, timeout |
 | chronyd: парные 127.0.0.1/[::1]:323, источники IPv4 | Настоящий chronyd 4.5 + регрессии |
 | SSH/tmux, endpoint, mux | Native-сценарии и raw evidence выдаются с комплектом; конкретные итоги указаны в отчёте |
-| Слияние Netplan, direct networkd, NM keyfile, ifupdown/2, static/DHCP4, DNS, метаданные, отказы | 114 тестов текущего встроенного исходника; команды менеджеров в unit-тестах подменены |
+| Слияние Netplan, direct networkd, NM keyfile, ifupdown/2, static/DHCP4, DNS, метаданные, отказы | 115 тестов текущего встроенного исходника; команды менеджеров в unit-тестах подменены |
 | Остальные native-матрицы V2 | История другого SHA; не выдаётся за native-приёмку 2.2 |
 
 Cloud-init + ifupdown2 boot остаётся PARTIAL. Native ifcfg-rh и enforcing SELinux не подтверждены. Другие дистрибутивы и системы без systemd не объявляются проверенными. Перезагрузка рабочей VPS требует отдельного GO; reboot выполняется только на одноразовой VM.
@@ -52,6 +52,6 @@ Cloud-init + ifupdown2 boot остаётся PARTIAL. Native ifcfg-rh и enforci
 
 `src/engine.py`, `src/display.py` и `tools/engine-prefix.txt` являются читаемыми исходниками. `python tools/build.py` воспроизводимо собирает единственный автономный `ipv6.sh`; `--check` проверяет совпадение без записи. Встроенные байты Python сохраняют CRLF прежней версии, оболочка LF. Проверки: `python3 -B -m unittest discover -s tests -v` в Linux.
 
-SHA-256 `ipv6.sh`: `3253de1cf5dfcb43fe4ac434cfd9ed05797eb5b0b93a89fff010ba079fede38c`.
+SHA-256 `ipv6.sh`: `c105fac4c4ef38c0395a3139551c0b37c4d2a86f1e1e7e333827f5cc539fbcdf`.
 
 Проверки unit используют подмены и не заменяют ядро/менеджер. Raw native evidence, снимки исходников, runners и серверные backups остаются в локальном комплекте; credentials и рабочие конфиги в GitHub не публикуются.
