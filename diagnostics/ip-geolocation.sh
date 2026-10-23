@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 geo_main() {
+  printf '\033[38;5;73m\n============================================================\nГЕО IPV4 ИНТЕРФЕЙСОВ\n============================================================\033[0m\n'
   local c
   for c in curl jq ip timeout awk grep sed; do command -v "$c" >/dev/null || { printf "\033[31mСТОП: нужен %s\033[0m\n" "$c" >&2; return 1; }; done
 # Full picture (services + authority + observation) — устойчивые запросы
@@ -231,6 +232,8 @@ for IP in $IPS; do
 
   echo
 done
-((BAD==0))
+if ((BAD)); then printf '\033[31mСТОП: геобазы не дали данных\033[0m\n'; return 1; fi
+printf '\033[92mВСЁ ОК: гео-сводка сформирована; N/A не означает доступность сервиса\033[0m\n'
 }
+
 if [[ -z ${BASH_SOURCE[0]:-} || ${BASH_SOURCE[0]} == "$0" ]]; then geo_main "$@"; fi
