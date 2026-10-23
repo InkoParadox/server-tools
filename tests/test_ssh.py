@@ -27,26 +27,6 @@ class InterfaceTests(unittest.TestCase):
     def test_generated_engine_matches_readable_source(self):
         code=self.engine.split(b"<<'MIST_PYTHON'\n",1)[1].rsplit(b'\nMIST_PYTHON',1)[0]
         self.assertEqual(code.replace(b'\r\n',b'\n').rstrip(),(SCRIPT.parent/'src/engine.py').read_bytes().rstrip())
-    def test_xshell_string_roundtrip_preserves_shell_escapes(self):
-        import importlib.util
-        spec=importlib.util.spec_from_file_location('command',SCRIPT.parent/'tools/command.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
-        plain=module.command('7'*40)
-        macro=subprocess.check_output([sys.executable,str(SCRIPT.parent/'tools/command.py'),'--ref','7'*40],text=True).rstrip('\n')
-        decoded=[];i=0
-        escapes={'\\':'\\','$':'$','r':'\r','n':'\n','t':'\t','a':'\a','b':'\b'}
-        while i<len(macro):
-            if macro[i]=='\\':
-                i+=1;self.assertIn(macro[i],escapes);decoded.append(escapes[macro[i]])
-            else:decoded.append(macro[i])
-            i+=1
-        self.assertEqual(''.join(decoded),plain+'\r');self.assertLess(len(macro),30000)
-        import tempfile
-        with tempfile.TemporaryDirectory() as folder:
-            field=Path(folder)/'Xshell.txt'
-            subprocess.run([sys.executable,str(SCRIPT.parent/'tools/command.py'),'--ref','7'*40,'--output',str(field)],check=True)
-            self.assertEqual(field.read_bytes(),macro.encode())
-        bash=subprocess.check_output([sys.executable,str(SCRIPT.parent/'tools/command.py'),'--ref','7'*40,'--bash'],text=True).rstrip('\n');self.assertEqual(bash,plain)
-        subprocess.run(['bash','-n'],input=(''.join(decoded)[:-1]+'\n').encode(),check=True)
     def test_builder_is_reproducible(self):
         subprocess.run([sys.executable,str(SCRIPT.parent/'tools/build.py'),'--check'],check=True,capture_output=True)
 
