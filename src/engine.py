@@ -930,7 +930,7 @@ def arm(d,seconds):
     unit,service,timer=unit_paths(d);link=timer.parent/'timers.target.wants'/timer.name
     need(not service.exists() and not timer.exists() and not link.exists() and not link.is_symlink(),'rollback unit collision; foreign unit left unchanged')
     service_data=('[Unit]\nDescription=MIST IPv6 transaction rollback\nAfter=network.target\n[Service]\nType=oneshot\nExecStart=/bin/bash '+str(d/'tool.sh')+' --automatic-restore '+str(d)+'\nRestart=on-failure\nRestartSec=15s\nTimeoutStartSec=180s\n').encode()
-    timer_data=('[Unit]\nDescription=MIST IPv6 confirmation deadline and boot rollback\n[Timer]\nOnActiveSec='+str(seconds)+'s\nAccuracySec=1s\n[Install]\nWantedBy=timers.target\n').encode()
+    timer_data=('[Unit]\nDescription=MIST IPv6 confirmation deadline and boot rollback\n[Timer]\nOnBootSec=0\nOnActiveSec='+str(seconds)+'s\nAccuracySec=1s\n[Install]\nWantedBy=timers.target\n').encode()
     owned={}
     try:
         for q,data in ((service,service_data),(timer,timer_data)):
@@ -1017,9 +1017,13 @@ def restore_runtime(before):
             run(['ip',flag,'address','del',addr+'/'+str(prefix),'dev',dev])
 
 def restore(d,automatic=False):
-    d,s=load(d);status=read_status(d)['status']
+    d,s=load(d);view=read_status(d);status=view['status']
     need(not automatic or status!='unknown','status corrupt; automatic restore withheld to avoid undoing a committed transaction')
-    if status=='rolled_back' or (automatic and status=='committed'):return emit(status='RESTORE_NOOP',transaction=str(d),previous=status)
+    if status=='rolled_back' or (automatic and status in ('committed','prepared_failed')):return emit(status='RESTORE_NOOP',transaction=str(d),previous=status)
+    # OnBootSec=0 also fires on initial activation. That wakeup must not
+    # undo a healthy pending operation during its original monotonic window.
+    if automatic and status=='awaiting_confirmation' and s['boot']==p('/proc/sys/kernel/random/boot_id').read_text().strip() and time.monotonic()<view.get('deadline_monotonic',0):
+        return emit(status='WATCHDOG_WAIT',transaction=str(d),remaining_seconds=max(0,int(view['deadline_monotonic']-time.monotonic())))
     if not automatic and not active(unit_paths(d)[0]+'.timer'):arm(d,60)
     status_write(d,'restoring');errors=[]
     # Check ALL read inputs before any restore write. A stale snapshot must not

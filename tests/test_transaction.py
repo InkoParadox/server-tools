@@ -78,6 +78,14 @@ class Transaction(unittest.TestCase):
     self.b['routes4'][0]['dev']='other' if scenario=='unrelated' else 'eth.123'
     with self.assertRaisesRegex(e.Stop,'IPv4'):self.apply()
     self.assertFalse(e.p(e.STATE).exists());self.assertFalse(self.armed)
+ def test_early_boot_trigger_keeps_pending_same_boot(self):
+  d=self.apply();out=io.StringIO()
+  with contextlib.redirect_stdout(out):e.restore(d,True)
+  self.assertEqual(json.loads(out.getvalue())['status'],'WATCHDOG_WAIT');self.assertEqual(e.read_status(d)['status'],'awaiting_confirmation');self.assertTrue(self.armed);self.assertEqual(e.p('/etc/netplan/test.yaml').read_bytes(),b'after')
+ def test_boot_trigger_restores_without_new_interval(self):
+  d=self.apply();e.p('/proc/sys/kernel/random/boot_id').write_text('newboot')
+  with contextlib.redirect_stdout(io.StringIO()):e.restore(d,True)
+  self.assertEqual(e.read_status(d)['status'],'rolled_back');self.assertFalse(self.armed);self.assertEqual(e.p('/etc/netplan/test.yaml').read_bytes(),b'before')
  def test_restore_exact_files_knobs(self):
   d=self.apply()
   with contextlib.redirect_stdout(io.StringIO()):e.restore(d)
@@ -141,6 +149,9 @@ class Transaction(unittest.TestCase):
   self.patch('arm',lambda d,s:(_ for _ in ()).throw(e.Stop('arm failed')))
   with self.assertRaises(e.Stop):e.apply(60)
   self.assertEqual(e.p('/etc/netplan/test.yaml').read_bytes(),b'before');self.assertFalse(e.p(e.POLICY).exists())
+  d=next(e.p(e.STATE).glob('tx-*'))
+  with contextlib.redirect_stdout(io.StringIO()):e.restore(d,True)
+  self.assertEqual(e.read_status(d)['status'],'prepared_failed')
  def test_real_flock_concurrent_stop(self):
   e.p('/run/lock').mkdir(parents=True,exist_ok=True)
   with e.p('/run/lock/mist-ipv6.lock').open('a') as f,patch.object(sys,'argv',['tool','--status']):

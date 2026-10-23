@@ -5,7 +5,7 @@ export PYTHONUTF8=1
 command -v python3 >/dev/null || { printf '\033[1;31mSTOP: python3 required\033[0m\n' >&2; exit 1; }
 umask 077
 mist_ipv6_ui_dir=$(mktemp -d /root/mist-ipv6-xshell-XXXXXXXX)
-cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_20F85A657294'
+cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_7645500E727D'
 #!/usr/bin/env bash
 set -eu
 export PYTHONUTF8=1
@@ -944,7 +944,7 @@ def arm(d,seconds):
     unit,service,timer=unit_paths(d);link=timer.parent/'timers.target.wants'/timer.name
     need(not service.exists() and not timer.exists() and not link.exists() and not link.is_symlink(),'rollback unit collision; foreign unit left unchanged')
     service_data=('[Unit]\nDescription=MIST IPv6 transaction rollback\nAfter=network.target\n[Service]\nType=oneshot\nExecStart=/bin/bash '+str(d/'tool.sh')+' --automatic-restore '+str(d)+'\nRestart=on-failure\nRestartSec=15s\nTimeoutStartSec=180s\n').encode()
-    timer_data=('[Unit]\nDescription=MIST IPv6 confirmation deadline and boot rollback\n[Timer]\nOnActiveSec='+str(seconds)+'s\nAccuracySec=1s\n[Install]\nWantedBy=timers.target\n').encode()
+    timer_data=('[Unit]\nDescription=MIST IPv6 confirmation deadline and boot rollback\n[Timer]\nOnBootSec=0\nOnActiveSec='+str(seconds)+'s\nAccuracySec=1s\n[Install]\nWantedBy=timers.target\n').encode()
     owned={}
     try:
         for q,data in ((service,service_data),(timer,timer_data)):
@@ -1031,9 +1031,13 @@ def restore_runtime(before):
             run(['ip',flag,'address','del',addr+'/'+str(prefix),'dev',dev])
 
 def restore(d,automatic=False):
-    d,s=load(d);status=read_status(d)['status']
+    d,s=load(d);view=read_status(d);status=view['status']
     need(not automatic or status!='unknown','status corrupt; automatic restore withheld to avoid undoing a committed transaction')
-    if status=='rolled_back' or (automatic and status=='committed'):return emit(status='RESTORE_NOOP',transaction=str(d),previous=status)
+    if status=='rolled_back' or (automatic and status in ('committed','prepared_failed')):return emit(status='RESTORE_NOOP',transaction=str(d),previous=status)
+    # OnBootSec=0 also fires on initial activation. That wakeup must not
+    # undo a healthy pending operation during its original monotonic window.
+    if automatic and status=='awaiting_confirmation' and s['boot']==p('/proc/sys/kernel/random/boot_id').read_text().strip() and time.monotonic()<view.get('deadline_monotonic',0):
+        return emit(status='WATCHDOG_WAIT',transaction=str(d),remaining_seconds=max(0,int(view['deadline_monotonic']-time.monotonic())))
     if not automatic and not active(unit_paths(d)[0]+'.timer'):arm(d,60)
     status_write(d,'restoring');errors=[]
     # Check ALL read inputs before any restore write. A stale snapshot must not
@@ -1250,8 +1254,8 @@ if __name__=='__main__':
     try:main()
     except Exception as e:emit(**dict(getattr(e,'details',{}),status='STOP',reason=str(e)));sys.exit(1)
 MIST_PYTHON
-MIST_ENGINE_EXACT_20F85A657294
-printf '%s  %s\n' '20f85a657294143847490e6c466b4cd0c013ac53ea6d1a8ad51a9aab44db42d1' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
+MIST_ENGINE_EXACT_7645500E727D
+printf '%s  %s\n' '7645500e727d082947952238a1ffdbd81f47af34121a8966d592b0332dfa149f' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
 chmod 700 "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 cat > "$mist_ipv6_ui_dir/display.py" <<'MIST_XSHELL_DISPLAY_EOF'
 #!/usr/bin/env python3
@@ -1371,7 +1375,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         raise SystemExit(130)
 MIST_XSHELL_DISPLAY_EOF
-export MIST_IPV6_VERIFIED_SHA=20f85a657294143847490e6c466b4cd0c013ac53ea6d1a8ad51a9aab44db42d1
+export MIST_IPV6_VERIFIED_SHA=7645500e727d082947952238a1ffdbd81f47af34121a8966d592b0332dfa149f
 export MIST_IPV6_SAVED_SOURCE="$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 [ "$#" -gt 0 ] || set -- --apply
 bash "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" "$@" | python3 "$mist_ipv6_ui_dir/display.py"
