@@ -3,7 +3,7 @@
 import argparse,base64,copy,ctypes,errno,fcntl,socket,struct,collections,glob,hashlib,ipaddress,json,os,pathlib,re,shlex,shutil,signal,stat,subprocess,sys,tempfile,time,uuid
 need_python = sys.version_info >= (3,8)
 if not need_python:raise SystemExit('STOP: Python >=3.8 required; no package installed')
-VERSION='2.3'
+VERSION='2.3.1'
 APPLY_DEADLINE=None
 ROOT=pathlib.Path('/')
 STATE='/var/lib/mist-ipv6'
@@ -113,7 +113,9 @@ def matches(path,record):
     q=p(path)
     if not q.exists():return not record.get('exists',False)
     st=q.stat();actual={'mode':stat.S_IMODE(st.st_mode),'uid':st.st_uid,'gid':st.st_gid,'mtime':st.st_mtime_ns}
-    if new_boot:actual.pop('mtime') # exact native output may be re-created by cloud-init at boot
+    # Netplan's systemd generator recreates these outputs on daemon-reload,
+    # including our watchdog setup. Keep content/permissions/owner/ACL checks.
+    if new_boot or (path.startswith('/run/systemd/network/10-netplan-') and path.endswith('.network')):actual.pop('mtime')
     return all(actual[k]==record[k] for k in actual if k in record) and ('xattrs' not in record or xattrs(q)==record['xattrs'])
 
 def yaml_load(text):
@@ -909,7 +911,7 @@ def load(d):
     for name in ('backup','backup-mirror'):
         try:
             b=(d/(name+'.json')).read_bytes();expected=(d/(name+'.sha256')).read_text().strip();need(sha(b)==expected,'backup digest mismatch')
-            s=json.loads(b);need(s['version'] in ('2.1','2.2',VERSION),'backup version mismatch')
+            s=json.loads(b);need(s['version'] in ('2.1','2.2','2.3',VERSION),'backup version mismatch')
             need(s['machine']==p('/etc/machine-id').read_text().strip(),'backup belongs to a different machine')
             need(sha((d/'tool.sh').read_bytes())==s['tool_sha'],'backup tool digest mismatch')
             for path,r in s['files'].items():

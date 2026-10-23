@@ -5,7 +5,7 @@ export PYTHONUTF8=1
 command -v python3 >/dev/null || { printf '\033[1;31mSTOP: python3 required\033[0m\n' >&2; exit 1; }
 umask 077
 mist_ipv6_ui_dir=$(mktemp -d /root/mist-ipv6-xshell-XXXXXXXX)
-cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_7645500E727D'
+cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_7092EE04FE6D'
 #!/usr/bin/env bash
 set -eu
 export PYTHONUTF8=1
@@ -17,7 +17,7 @@ exec python3 - "$@" <<'MIST_PYTHON'
 import argparse,base64,copy,ctypes,errno,fcntl,socket,struct,collections,glob,hashlib,ipaddress,json,os,pathlib,re,shlex,shutil,signal,stat,subprocess,sys,tempfile,time,uuid
 need_python = sys.version_info >= (3,8)
 if not need_python:raise SystemExit('STOP: Python >=3.8 required; no package installed')
-VERSION='2.3'
+VERSION='2.3.1'
 APPLY_DEADLINE=None
 ROOT=pathlib.Path('/')
 STATE='/var/lib/mist-ipv6'
@@ -127,7 +127,9 @@ def matches(path,record):
     q=p(path)
     if not q.exists():return not record.get('exists',False)
     st=q.stat();actual={'mode':stat.S_IMODE(st.st_mode),'uid':st.st_uid,'gid':st.st_gid,'mtime':st.st_mtime_ns}
-    if new_boot:actual.pop('mtime') # exact native output may be re-created by cloud-init at boot
+    # Netplan's systemd generator recreates these outputs on daemon-reload,
+    # including our watchdog setup. Keep content/permissions/owner/ACL checks.
+    if new_boot or (path.startswith('/run/systemd/network/10-netplan-') and path.endswith('.network')):actual.pop('mtime')
     return all(actual[k]==record[k] for k in actual if k in record) and ('xattrs' not in record or xattrs(q)==record['xattrs'])
 
 def yaml_load(text):
@@ -923,7 +925,7 @@ def load(d):
     for name in ('backup','backup-mirror'):
         try:
             b=(d/(name+'.json')).read_bytes();expected=(d/(name+'.sha256')).read_text().strip();need(sha(b)==expected,'backup digest mismatch')
-            s=json.loads(b);need(s['version'] in ('2.1','2.2',VERSION),'backup version mismatch')
+            s=json.loads(b);need(s['version'] in ('2.1','2.2','2.3',VERSION),'backup version mismatch')
             need(s['machine']==p('/etc/machine-id').read_text().strip(),'backup belongs to a different machine')
             need(sha((d/'tool.sh').read_bytes())==s['tool_sha'],'backup tool digest mismatch')
             for path,r in s['files'].items():
@@ -1254,8 +1256,8 @@ if __name__=='__main__':
     try:main()
     except Exception as e:emit(**dict(getattr(e,'details',{}),status='STOP',reason=str(e)));sys.exit(1)
 MIST_PYTHON
-MIST_ENGINE_EXACT_7645500E727D
-printf '%s  %s\n' '7645500e727d082947952238a1ffdbd81f47af34121a8966d592b0332dfa149f' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
+MIST_ENGINE_EXACT_7092EE04FE6D
+printf '%s  %s\n' '7092ee04fe6de6e5da5b9780d8785eac9c9a14e70ec8bbff61a89a4055720142' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
 chmod 700 "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 cat > "$mist_ipv6_ui_dir/display.py" <<'MIST_XSHELL_DISPLAY_EOF'
 #!/usr/bin/env python3
@@ -1375,7 +1377,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         raise SystemExit(130)
 MIST_XSHELL_DISPLAY_EOF
-export MIST_IPV6_VERIFIED_SHA=7645500e727d082947952238a1ffdbd81f47af34121a8966d592b0332dfa149f
+export MIST_IPV6_VERIFIED_SHA=7092ee04fe6de6e5da5b9780d8785eac9c9a14e70ec8bbff61a89a4055720142
 export MIST_IPV6_SAVED_SOURCE="$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 [ "$#" -gt 0 ] || set -- --apply
 bash "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" "$@" | python3 "$mist_ipv6_ui_dir/display.py"
