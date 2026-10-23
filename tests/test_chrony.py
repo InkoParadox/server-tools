@@ -233,13 +233,13 @@ class ChronyTests(unittest.TestCase):
         digest = hashlib.sha256(self.engine).hexdigest().encode()
         self.assertEqual(self.launcher.count(digest), 2)
         subprocess.run(['bash', '-n'], input=self.launcher, check=True)
-        self.assertEqual(self.api['VERSION'], '2.1')
+        self.assertEqual(self.api['VERSION'], '2.3')
 
     def test_noop_repeated_run_still_requires_no_network_writes(self):
         self.before.update(knobs={'lo': {'disable_ipv6': 1}}, addr6=[], routes6=[])
         plan = type('PlanFixture', (), {'changes': {}, 'owners': {'eth0': 'netplan/networkd'}})()
         events = []
-        self.api.update(ssh_session=lambda: ['203.0.113.1', '50000', '203.0.113.2', '22'],
+        self.api.update(ssh_session=lambda **kw: {'tuple':['203.0.113.1', '50000', '203.0.113.2', '22']}, connection_live=lambda proof: True,
                         pending=lambda: [], discover=lambda: (plan, self.before), validate_plan=lambda plan: None,
                         emit=lambda **event: events.append(event))
         self.dependencies()
@@ -250,7 +250,7 @@ class ChronyTests(unittest.TestCase):
     def test_monitor_failure_after_apply_enters_existing_restore_path(self):
         self.dependencies()
         self.before.update(knobs={'lo': {'disable_ipv6': 0}}, addr6=[], routes6=[],
-                           addr4=[{'addr_info': [{'local': '203.0.113.2'}]}], dns_probe_ok=False)
+                           links=[{'ifname':'eth0','flags':['UP'],'operstate':'UP'}], addr4=[{'ifname':'eth0','addr_info': [{'family':'inet','local': '203.0.113.2'}]}], routes4=[{'dst':'default','dev':'eth0'}], dns_probe_ok=False)
         for name, value in (('etc/machine-id', 'test-machine'), ('proc/sys/kernel/random/boot_id', 'test-boot')):
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -264,7 +264,7 @@ class ChronyTests(unittest.TestCase):
         def apply_actions(actions):
             self.monitor_error = self.api['Stop']('monitor lost after apply')
 
-        self.api.update(ssh_session=lambda: ['203.0.113.1', '50000', '203.0.113.2', '22'],
+        self.api.update(ssh_session=lambda **kw: {'tuple':['203.0.113.1', '50000', '203.0.113.2', '22']}, connection_live=lambda proof: True,
                         pending=lambda: [], discover=lambda: (plan, self.before), validate_plan=lambda plan: None,
                         arm=lambda d, seconds: armed.append(d), race_check=lambda plan: None,
                         apply_actions=apply_actions, verify_nm=lambda actions: None,
@@ -287,12 +287,13 @@ class ChronyTests(unittest.TestCase):
         boot.parent.mkdir(parents=True)
         boot.write_text('test-boot')
         self.prepare_postcheck()
+        self.before.update(links=[{'ifname':'eth0','flags':['UP'],'operstate':'UP'}],addr4=[{'ifname':'eth0','addr_info':[{'family':'inet','local':'203.0.113.2'}]}],routes4=[{'dst':'default','dev':'eth0'}])
         self.csv = source(state='?')
         disarmed, states = [], []
         self.api.update(load=lambda d: (Path(d), {'ssh': ['203.0.113.1', '50000', '203.0.113.2', '22'],
-                                                'boot': 'test-boot', 'before': self.before}),
-                        read_status=lambda d: {'status': 'awaiting_confirmation', 'deadline_monotonic': float('inf')},
-                        ssh_session=lambda: ['203.0.113.1', '50001', '203.0.113.2', '22'],
+                                                'transport': {'tuple': [], 'boot_id':'test-boot', 'inode':'1'}, 'boot': 'test-boot', 'before': self.before}),
+                        read_status=lambda d: {'status': 'awaiting_confirmation', 'deadline_monotonic': 10**20, 'boot':'test-boot', 'confirmation_ready_ticks':1},
+                        ssh_session=lambda **kw: {'tuple':['203.0.113.1', '50001', '203.0.113.2', '22'], 'boot_id':'test-boot','inode':'2','sshd_start_ticks':2}, connection_live=lambda proof: True,
                         active=lambda unit: True, disarm=lambda d: disarmed.append(d),
                         status_write=lambda *args, **kwargs: states.append(args))
         with self.assertRaisesRegex(self.api['Stop'], 'no selected IPv4 time source'):

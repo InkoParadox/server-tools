@@ -1,0 +1,4 @@
+ipv6.sh -text
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf

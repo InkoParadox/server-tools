@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export PYTHONUTF8=1
-[ "$(id -u)" -eq 0 ] || { printf '\033[1;31mSTOP: root SSH required\033[0m\n' >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || { printf '\033[1;31mSTOP: root required\033[0m\n' >&2; exit 1; }
 command -v python3 >/dev/null || { printf '\033[1;31mSTOP: python3 required\033[0m\n' >&2; exit 1; }
 umask 077
 mist_ipv6_ui_dir=$(mktemp -d /root/mist-ipv6-xshell-XXXXXXXX)
-cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_3E1820B483D0'
+cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_7645500E727D'
 #!/usr/bin/env bash
 set -eu
 export PYTHONUTF8=1
@@ -17,7 +17,7 @@ exec python3 - "$@" <<'MIST_PYTHON'
 import argparse,base64,copy,ctypes,errno,fcntl,socket,struct,collections,glob,hashlib,ipaddress,json,os,pathlib,re,shlex,shutil,signal,stat,subprocess,sys,tempfile,time,uuid
 need_python = sys.version_info >= (3,8)
 if not need_python:raise SystemExit('STOP: Python >=3.8 required; no package installed')
-VERSION='2.1'
+VERSION='2.3'
 APPLY_DEADLINE=None
 ROOT=pathlib.Path('/')
 STATE='/var/lib/mist-ipv6'
@@ -675,12 +675,12 @@ def verify_off(before):
     if before.get('dns_probe_ok',True):run(['getent','ahostsv4','example.com'],timeout=12)
     if before.get('chrony_ipv4_monitor'):chrony_ipv4_sources()
     return now
-def ssh_session():
-    f=os.environ.get('SSH_CONNECTION','').split();need(len(f)==4,'authenticated external IPv4 SSH required (SSH_CONNECTION)')
-    try:c,s=ipaddress.ip_address(f[0]),ipaddress.ip_address(f[2]);ports=[int(f[1]),int(f[3])]
-    except ValueError:raise Stop('malformed SSH_CONNECTION')
-    need(c.version==s.version==4 and not c.is_loopback and not s.is_loopback and all(0<v<65536 for v in ports),'external IPv4 SSH required')
-    return f
+def transaction_error(code, message, **details):
+    error = Stop(message)
+    error.details = dict(error_code=code, **details)
+    raise error
+
+
 def tcp_peers(text):
     peers=[]
     for l in text.splitlines():
@@ -923,7 +923,7 @@ def load(d):
     for name in ('backup','backup-mirror'):
         try:
             b=(d/(name+'.json')).read_bytes();expected=(d/(name+'.sha256')).read_text().strip();need(sha(b)==expected,'backup digest mismatch')
-            s=json.loads(b);need(s['version']==VERSION,'backup version mismatch')
+            s=json.loads(b);need(s['version'] in ('2.1','2.2',VERSION),'backup version mismatch')
             need(s['machine']==p('/etc/machine-id').read_text().strip(),'backup belongs to a different machine')
             need(sha((d/'tool.sh').read_bytes())==s['tool_sha'],'backup tool digest mismatch')
             for path,r in s['files'].items():
@@ -944,7 +944,7 @@ def arm(d,seconds):
     unit,service,timer=unit_paths(d);link=timer.parent/'timers.target.wants'/timer.name
     need(not service.exists() and not timer.exists() and not link.exists() and not link.is_symlink(),'rollback unit collision; foreign unit left unchanged')
     service_data=('[Unit]\nDescription=MIST IPv6 transaction rollback\nAfter=network.target\n[Service]\nType=oneshot\nExecStart=/bin/bash '+str(d/'tool.sh')+' --automatic-restore '+str(d)+'\nRestart=on-failure\nRestartSec=15s\nTimeoutStartSec=180s\n').encode()
-    timer_data=('[Unit]\nDescription=MIST IPv6 confirmation deadline and boot rollback\n[Timer]\nOnActiveSec='+str(seconds)+'s\nAccuracySec=1s\n[Install]\nWantedBy=timers.target\n').encode()
+    timer_data=('[Unit]\nDescription=MIST IPv6 confirmation deadline and boot rollback\n[Timer]\nOnBootSec=0\nOnActiveSec='+str(seconds)+'s\nAccuracySec=1s\n[Install]\nWantedBy=timers.target\n').encode()
     owned={}
     try:
         for q,data in ((service,service_data),(timer,timer_data)):
@@ -1031,9 +1031,13 @@ def restore_runtime(before):
             run(['ip',flag,'address','del',addr+'/'+str(prefix),'dev',dev])
 
 def restore(d,automatic=False):
-    d,s=load(d);status=read_status(d)['status']
+    d,s=load(d);view=read_status(d);status=view['status']
     need(not automatic or status!='unknown','status corrupt; automatic restore withheld to avoid undoing a committed transaction')
-    if status=='rolled_back' or (automatic and status=='committed'):return emit(status='RESTORE_NOOP',transaction=str(d),previous=status)
+    if status=='rolled_back' or (automatic and status in ('committed','prepared_failed')):return emit(status='RESTORE_NOOP',transaction=str(d),previous=status)
+    # OnBootSec=0 also fires on initial activation. That wakeup must not
+    # undo a healthy pending operation during its original monotonic window.
+    if automatic and status=='awaiting_confirmation' and s['boot']==p('/proc/sys/kernel/random/boot_id').read_text().strip() and time.monotonic()<view.get('deadline_monotonic',0):
+        return emit(status='WATCHDOG_WAIT',transaction=str(d),remaining_seconds=max(0,int(view['deadline_monotonic']-time.monotonic())))
     if not automatic and not active(unit_paths(d)[0]+'.timer'):arm(d,60)
     status_write(d,'restoring');errors=[]
     # Check ALL read inputs before any restore write. A stale snapshot must not
@@ -1097,13 +1101,37 @@ def restore(d,automatic=False):
 
 def pending():
     return [d for d in p(STATE).glob('tx-*') if d.is_dir() and read_status(d)['status'] not in ('committed','rolled_back','prepared_failed')]
+def host_context():
+    need(os.stat('/proc/self/ns/net').st_ino == os.stat('/proc/1/ns/net').st_ino, 'run in the host PID 1 network namespace')
+    need(shutil.which('systemd-detect-virt'), 'systemd-detect-virt required to distinguish the host from a container')
+    detected=run(['systemd-detect-virt','--container'],False)
+    need(detected.returncode==1 and detected.stdout.strip()=='none',
+         'container or unverifiable host context; network writes refused: '+detected.stdout.strip())
+
+
+def require_ipv4(before):
+    links={r['ifname']:r for r in before.get('links',[])}
+    eligible=set()
+    for row in before.get('addr4',[]):
+        name=row.get('ifname');link=links.get(name,{})
+        if 'UP' not in link.get('flags',[]) or link.get('operstate') not in ('UP','UNKNOWN'):continue
+        for a in row.get('addr_info',[]):
+            if a.get('family')!='inet':continue
+            address=ipaddress.ip_address(a['local'])
+            if not (address.is_loopback or address.is_link_local or address.is_unspecified or address.is_multicast):eligible.add(name)
+    need(eligible,'no usable non-loopback IPv4 address on an operational interface; IPv6 may be the only host connectivity')
+    routes=[r for r in before.get('routes4',[]) if r.get('type','unicast')=='unicast' and r.get('dst')=='default' and not {'linkdown','dead'}&set(r.get('flags',[]))]
+    need(any(r.get('dev') in eligible or any(n.get('dev') in eligible and not {'linkdown','dead'}&set(n.get('flags',[])) for n in r.get('nexthops',[])) for r in routes),
+         'no usable IPv4 default route through an operational interface with IPv4; refusing possible IPv6-only connectivity')
+
+
 def apply(seconds):
     global APPLY_DEADLINE
-    session=ssh_session();need(not pending(),'unfinished transaction exists; use --status/--restore')
+    need(not pending(),'unfinished transaction exists; use --status/--restore')
     pl,before=discover();validate_plan(pl)
     if not pl.changes and all(x.get('disable_ipv6')==1 for x in before['knobs'].values()) and not addr_set(before['addr6'],'inet6') and not before['routes6']:
         emit(status='NOOP',owners=pl.owners);return
-    need(any(a['local']==session[2] for x in before['addr4'] for a in x.get('addr_info',[])),'SSH server address is not on this host')
+    require_ipv4(before)
     created_dirs=set()
     for path in pl.changes:
         parent=p(path).parent
@@ -1117,7 +1145,7 @@ def apply(seconds):
     try:
         status_write(d,'prepared_failed') # no network writes until backup is complete and armed
         atomic(d/'tool.sh',b,0o700)
-        s={'version':VERSION,'machine':p('/etc/machine-id').read_text().strip(),'boot':p('/proc/sys/kernel/random/boot_id').read_text().strip(),'ssh':session,'before':before,
+        s={'version':VERSION,'machine':p('/etc/machine-id').read_text().strip(),'boot':p('/proc/sys/kernel/random/boot_id').read_text().strip(),'before':before,
            'created_dirs':sorted(created_dirs,key=len,reverse=True),'files':{path:pl.watched[path] for path in pl.changes},'after':pl.changes,'actions':pl.actions,'watched':{path:{k:v for k,v in rec.items() if k!='data' or path in pl.changes} for path,rec in pl.watched.items()},'inventory':pl.inventory,'owners':pl.owners,'tool_sha':sha(b)}
         save_backup(d,s)
         load(d);status_write(d,'prepared')
@@ -1150,8 +1178,8 @@ def apply(seconds):
         need(set(pl.watch_globs())==set(pl.inventory)|set(pl.changes),'configuration file set changed during apply')
         for path,r in pl.watched.items():need(matches(path,pl.changes.get(path,r)),'concurrent write during apply: '+path)
         APPLY_DEADLINE=None
-        status_write(d,'awaiting_confirmation',deadline_monotonic=deadline,ipv4_policy_reinstated=restored_rules4)
-        emit(status='AWAITING_CONFIRMATION',transaction=str(d),tool=str(d/'tool.sh'),machine=s['machine'],owners=pl.owners,seconds=seconds,ipv4_policy_reinstated=restored_rules4)
+        status_write(d,'awaiting_confirmation',deadline_monotonic=deadline,boot=s['boot'],ipv4_policy_reinstated=restored_rules4)
+        emit(status='AWAITING_CONFIRMATION',transaction=str(d),tool=str(d/'tool.sh'),machine=s['machine'],owners=pl.owners,seconds=max(0,int(deadline-time.monotonic())),watchdog_active=True,ipv4_policy_reinstated=restored_rules4)
     except BaseException as original:
         APPLY_DEADLINE=None
         atomic(d/'apply-error.txt',str(original).encode())
@@ -1163,26 +1191,51 @@ def apply(seconds):
             if armed:disarm(d)
         raise
 
+def transaction_view(d):
+    value=dict(transaction=str(d),**read_status(d))
+    if value['status']=='awaiting_confirmation':
+        boot=p('/proc/sys/kernel/random/boot_id').read_text().strip()
+        saved_boot=value.get('boot')
+        if saved_boot is None:
+            try:
+                _,backup=load(d);saved_boot=backup['boot']
+            except Exception as error:
+                value.update(same_boot=None,remaining_seconds=None,integrity_error=str(error),watchdog_active=active(unit_paths(d)[0]+'.timer'))
+                return value
+        value['same_boot']=saved_boot==boot
+        value['remaining_seconds']=max(0,int(value.get('deadline_monotonic',0)-time.monotonic())) if value['same_boot'] else 0
+        value['watchdog_active']=active(unit_paths(d)[0]+'.timer')
+    return value
+
+def confirmation_state(d,s):
+    view=transaction_view(d)
+    if view['status']!='awaiting_confirmation':
+        transaction_error('not_awaiting_confirmation','transaction is '+view['status']+'; no confirmation performed',**view)
+    if s['boot']!=p('/proc/sys/kernel/random/boot_id').read_text().strip():
+        transaction_error('server_rebooted','server rebooted before confirmation; restore required',**view)
+    if time.monotonic()>=view.get('deadline_monotonic',0):
+        transaction_error('confirmation_expired','confirmation deadline elapsed; watchdog remains armed',**view)
+    if not view['watchdog_active']:
+        transaction_error('watchdog_inactive','rollback watchdog is not active; confirmation refused',**view)
+    return view
+
 def confirm(d):
-    d,s=load(d);need(read_status(d)['status']=='awaiting_confirmation','transaction is not awaiting confirmation')
-    session=ssh_session();need(session!=s['ssh'] and session[2:]==s['ssh'][2:],'new external SSH connection to the same server endpoint required')
-    need(s['boot']==p('/proc/sys/kernel/random/boot_id').read_text().strip(),'server rebooted before confirmation; restore required')
-    need(time.monotonic()<read_status(d).get('deadline_monotonic',0),'confirmation deadline elapsed')
-    need(active(unit_paths(d)[0]+'.timer'),'rollback watchdog is not active')
-    verify_off(s['before'])
+    d,s=load(d);view=confirmation_state(d,s)
+    require_ipv4(s['before']);verify_off(s['before'])
     pl=Plan();pl.watched=s['watched'];pl.netplan_before={} if any(v.startswith('netplan/') for v in s['owners'].values()) else None
     have=set(pl.watch_globs());want=set(s['inventory'])|set(s['after'])
     need(have==want,'configuration file set changed before confirmation; missing='+str(sorted(want-have))+' added='+str(sorted(have-want)))
     for path,r in s['watched'].items():need(matches(path,s['after'].get(path,r)),'configuration changed before confirmation: '+path)
-    need(time.monotonic()<read_status(d).get('deadline_monotonic',0),'confirmation deadline elapsed during verification')
-    status_write(d,'committed',ssh=session);disarm(d);emit(status='COMMITTED',transaction=str(d))
+    confirmation_state(d,s)
+    status_write(d,'committed');disarm(d);emit(status='COMMITTED',transaction=str(d),watchdog_active=False)
 
 def main():
     ap=argparse.ArgumentParser(description='Transactional host IPv6 disable. Default: read-only check.')
     g=ap.add_mutually_exclusive_group();g.add_argument('--check',action='store_true');g.add_argument('--apply',action='store_true');g.add_argument('--status',action='store_true');g.add_argument('--confirm');g.add_argument('--restore');g.add_argument('--automatic-restore')
-    ap.add_argument('--rollback-seconds',type=int,default=240)
+    ap.add_argument('--rollback-seconds',type=int,default=600)
     a=ap.parse_args();need(os.geteuid()==0,'root required');need(60<=a.rollback_seconds<=1800,'rollback timeout must be 60..1800 seconds')
     for sig in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP):signal.signal(sig,lambda n,f:(_ for _ in ()).throw(Stop('interrupted by signal '+str(n))))
+    host_context()
     p('/run/lock').mkdir(exist_ok=True)
     fd=os.open(p('/run/lock/mist-ipv6.lock'),os.O_RDWR|os.O_CREAT|getattr(os,'O_NOFOLLOW',0),0o600)
     st=os.fstat(fd);need(stat.S_ISREG(st.st_mode) and st.st_uid==0 and not st.st_mode&0o022,'unsafe transaction lock file')
@@ -1191,16 +1244,18 @@ def main():
         except BlockingIOError:raise Stop('another IPv6 transaction is running')
         if a.restore or a.automatic_restore:restore(a.restore or a.automatic_restore,bool(a.automatic_restore))
         elif a.confirm:confirm(a.confirm)
-        elif a.status:emit(status='STATUS',transactions=[dict(transaction=str(d),**read_status(d)) for d in sorted(p(STATE).glob('tx-*')) if d.is_dir()])
+        elif a.status:emit(status='STATUS',transactions=[transaction_view(d) for d in sorted(p(STATE).glob('tx-*')) if d.is_dir()])
         elif a.apply:apply(a.rollback_seconds)
         else:
-            pl,before=discover();validate_plan(pl);emit(status='CHECK_OK',version=VERSION,owners=pl.owners,changes=sorted(pl.changes),actions=pl.actions,ipv6_disabled=all(x.get('disable_ipv6')==1 for x in before['knobs'].values()))
+            pl,before=discover();validate_plan(pl)
+            if pl.changes or not all(x.get('disable_ipv6')==1 for x in before['knobs'].values()) or addr_set(before['addr6'],'inet6') or before['routes6']:require_ipv4(before)
+            emit(status='CHECK_OK',version=VERSION,owners=pl.owners,changes=sorted(pl.changes),actions=pl.actions,ipv6_disabled=all(x.get('disable_ipv6')==1 for x in before['knobs'].values()))
 if __name__=='__main__':
     try:main()
-    except Exception as e:emit(status='STOP',reason=str(e));sys.exit(1)
+    except Exception as e:emit(**dict(getattr(e,'details',{}),status='STOP',reason=str(e)));sys.exit(1)
 MIST_PYTHON
-MIST_ENGINE_EXACT_3E1820B483D0
-printf '%s  %s\n' '3e1820b483d0c44e52800527d9cacd192712ce15acf0ca53d9ec148d07b95d2d' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status
+MIST_ENGINE_EXACT_7645500E727D
+printf '%s  %s\n' '7645500e727d082947952238a1ffdbd81f47af34121a8966d592b0332dfa149f' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
 chmod 700 "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 cat > "$mist_ipv6_ui_dir/display.py" <<'MIST_XSHELL_DISPLAY_EOF'
 #!/usr/bin/env python3
@@ -1212,13 +1267,15 @@ import sys
 
 
 def main():
-    human = sys.stdout.isatty()
-    color = human and 'NO_COLOR' not in os.environ and os.environ.get('TERM') != 'dumb'
+    mirror = os.environ.get('MIST_IPV6_UI') == 'stderr'
+    human = sys.stdout.isatty() or mirror
+    output = sys.stderr if mirror else sys.stdout
+    color = (mirror or output.isatty()) and 'NO_COLOR' not in os.environ and os.environ.get('TERM') != 'dumb'
 
     def say(text='', tone='0'):
         prefix = '\033[' + tone + 'm' if color else ''
         suffix = '\033[0m' if color else ''
-        print(prefix + str(text) + suffix, flush=True)
+        print(prefix + str(text) + suffix, file=output, flush=True)
 
     def owners(data):
         value = data.get('owners')
@@ -1226,7 +1283,7 @@ def main():
             say('  Сеть: ' + '; '.join(str(k) + ': ' + str(v) for k, v in value.items()), '36')
 
     if human:
-        say('\nMIST | IPv6 V2.1', '1;36')
+        say('\nMIST | IPv6 V2.3', '1;36')
         if os.environ.get('MIST_IPV6_VERIFIED_SHA'):
             say('[OK] Контрольная сумма исходника проверена', '32')
         if os.environ.get('MIST_IPV6_SAVED_SOURCE'):
@@ -1234,9 +1291,10 @@ def main():
         say('[...] Выполнение и проверка состояния сети...', '36')
 
     for raw in sys.stdin:
-        if not human:
+        if mirror or not human:
             sys.stdout.write(raw)
             sys.stdout.flush()
+        if not human:
             continue
         try:
             item = json.loads(raw)
@@ -1254,23 +1312,22 @@ def main():
         elif status == 'AWAITING_CONFIRMATION':
             say('[OK] IPv6 отключён. Локальные проверки пройдены.', '32')
             owners(item)
-            say('[ЖДЁТ] Нужна проверка из НОВОГО SSH-подключения.', '1;33')
+            say('[ЖДЁТ] Подтвердите результат до истечения страховки.', '1;33')
             seconds = item.get('seconds')
             if seconds is not None:
-                say('  Страховка: ' + str(seconds) + ' с с начала применения; отсчёт уже идёт.', '33')
+                say('  Страховка: ' + str(seconds) + ' с осталось до автоотката.', '33')
             transaction = item.get('transaction')
             tool = item.get('tool')
             if transaction:
                 say('  Резервная копия: ' + str(transaction), '36')
             if isinstance(tool, str) and isinstance(transaction, str):
-                say('  Откройте новое IPv4 SSH-подключение к этому же серверу и порту.', '33')
-                say('  В нём выполните команду подтверждения:', '33')
+                say('  После проверки доступности выполните одну команду:', '33')
                 confirm = ('bash ' + shlex.quote(tool) + ' --confirm ' + shlex.quote(transaction)
                            + ' | python3 ' + shlex.quote(os.path.abspath(__file__)))
                 say('  bash -o pipefail -c ' + shlex.quote(confirm), '1;36')
             say('  Без подтверждения автоматический откат останется включён.', '33')
         elif status == 'COMMITTED':
-            say('[OK] Проверка через новое SSH пройдена. Автооткат отменён.', '1;32')
+            say('[OK] Результат подтверждён. Автооткат отменён.', '1;32')
             if item.get('transaction'):
                 say('  Резервная копия сохранена: ' + str(item['transaction']), '36')
         elif status == 'ROLLED_BACK':
@@ -1278,7 +1335,7 @@ def main():
             if item.get('transaction'):
                 say('  Резервная копия: ' + str(item['transaction']), '36')
         elif status == 'RESTORE_NOOP':
-            say('[ИНФО] Повторное восстановление не требуется.', '36')
+            say('[OK] Повторное восстановление не требуется.', '32')
             say('  Состояние: ' + str(item.get('previous', 'unknown')), '90')
         elif status == 'IPV4_POLICY_REINSTATED':
             say('[ИНФО] Правила маршрутизации IPv4 восстановлены из снимка.', '33')
@@ -1290,12 +1347,24 @@ def main():
         elif status == 'STOP':
             say('[СТОП] Операция остановлена.', '1;31')
             say('  Причина: ' + str(item.get('reason', 'не указана')), '31')
+            if item.get('error_code'):
+                say('  Код: ' + str(item['error_code']), '31')
+            if item.get('same_boot') is False:
+                say('  Сервер перезагружен: подтверждение закрыто; страховка: ' + str(item.get('watchdog_active')), '33')
+            elif 'remaining_seconds' in item:
+                say('  До автоотката: ' + str(item['remaining_seconds']) + ' с; страховка: ' + str(item.get('watchdog_active')), '33')
         elif status == 'STATUS':
             say('[ИНФО] Состояние сохранённых операций', '1;36')
             for tx in item.get('transactions', []):
                 state = tx.get('status', 'unknown')
                 tone = '32' if state == 'committed' else '31' if state == 'restore_failed' else '33'
                 say('  ' + str(tx.get('transaction', '')) + ': ' + str(state), tone)
+                if tx.get('same_boot') is False:
+                    say('    Сервер перезагружен: подтверждение закрыто; страховка: ' + str(tx.get('watchdog_active')), '33')
+                elif tx.get('integrity_error'):
+                    say('    Время не подтверждено: ' + str(tx['integrity_error']) + '; страховка: ' + str(tx.get('watchdog_active')), '33')
+                elif 'remaining_seconds' in tx:
+                    say('    До автоотката: ' + str(tx['remaining_seconds']) + ' с; страховка: ' + str(tx.get('watchdog_active')), '33')
         else:
             say('[ИНФО] ' + json.dumps(item, ensure_ascii=False), '36')
 
@@ -1306,6 +1375,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         raise SystemExit(130)
 MIST_XSHELL_DISPLAY_EOF
-export MIST_IPV6_VERIFIED_SHA=3e1820b483d0c44e52800527d9cacd192712ce15acf0ca53d9ec148d07b95d2d
+export MIST_IPV6_VERIFIED_SHA=7645500e727d082947952238a1ffdbd81f47af34121a8966d592b0332dfa149f
 export MIST_IPV6_SAVED_SOURCE="$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
-bash "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" --apply | python3 "$mist_ipv6_ui_dir/display.py"
+[ "$#" -gt 0 ] || set -- --apply
+bash "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" "$@" | python3 "$mist_ipv6_ui_dir/display.py"
