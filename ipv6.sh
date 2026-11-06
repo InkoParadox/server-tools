@@ -5,7 +5,7 @@ export PYTHONUTF8=1
 command -v python3 >/dev/null || { printf '\033[1;31mSTOP: python3 required\033[0m\n' >&2; exit 1; }
 umask 077
 mist_ipv6_ui_dir=$(mktemp -d /root/mist-ipv6-xshell-XXXXXXXX)
-cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_B202FF5CED11'
+cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_ACE1354D44B5'
 #!/usr/bin/env bash
 set -eu
 export PYTHONUTF8=1
@@ -17,7 +17,7 @@ exec python3 - "$@" <<'MIST_PYTHON'
 import argparse,base64,copy,ctypes,errno,fcntl,socket,struct,collections,glob,hashlib,ipaddress,json,os,pathlib,re,shlex,shutil,signal,stat,subprocess,sys,tempfile,time,uuid
 need_python = sys.version_info >= (3,8)
 if not need_python:raise SystemExit('STOP: Python >=3.8 required; no package installed')
-VERSION='2.3.2'
+VERSION='2.3.3'
 APPLY_DEADLINE=None
 ROOT=pathlib.Path('/')
 STATE='/var/lib/mist-ipv6'
@@ -157,7 +157,73 @@ def cloud_network(text):
     need(isinstance(node,yaml.MappingNode),'cloud-init config is not a mapping')
     values=[v for k,v in node.value if isinstance(k,yaml.ScalarNode) and k.value=='network']
     need(len(values)<=1,'duplicate cloud-init network key')
+    if values:
+        need(not any(isinstance(k,yaml.ScalarNode) and k.value in ('merge_how','merge_type') for k,_ in node.value),
+             'custom cloud-init network merge requires its provisioning owner')
     return {'network':yaml_load(yaml.serialize(values[0]))} if values else {}
+
+def merge_cloud_network(base,override):
+    # cloud.cfg.d keeps lower priority mapping keys but replaces scalar/list leaves.
+    merged=dict(base)
+    for key,value in override.items():
+        old=merged.get(key)
+        merged[key]=merge_cloud_network(old,value) if isinstance(old,dict) and isinstance(value,dict) else value
+    return merged
+
+def cloud_v1_dns(value, split=False):
+    need(isinstance(value,(list,str)),'unsupported cloud-init v1 DNS address type')
+    addresses=value.split() if split and isinstance(value,str) else [value] if isinstance(value,str) else value
+    need(all(isinstance(addr,str) for addr in addresses),'unsupported cloud-init v1 DNS address entry')
+    kept=[addr for addr in addresses if not is6(addr)]
+    return value if len(kept)==len(addresses) else kept
+
+def cloud_v1_routes(routes):
+    need(isinstance(routes,list),'invalid cloud-init v1 routes')
+    kept=[]
+    for route in routes:
+        need(isinstance(route,dict),'invalid cloud-init v1 route')
+        destination=route.get('destination',route.get('network',''));gateway=route.get('gateway','')
+        need(not (destination and destination!='default' and gateway and is6(destination)!=is6(gateway)),
+             'cloud-init v1 route mixes address families')
+        if not is6(destination) and not is6(gateway):kept.append(route)
+    return kept
+
+def strip_cloud_v1(net):
+    desired=copy.deepcopy(net)
+    config=desired.get('config',[])
+    need(isinstance(config,list),'invalid cloud-init v1 config')
+    cleaned=[]
+    for item in config:
+        need(isinstance(item,dict),'invalid cloud-init v1 config entry')
+        if 'accept-ra' in item:item['accept-ra']=False
+        if item.get('type')=='nameserver':
+            addresses=item.get('address',[]);kept=cloud_v1_dns(addresses)
+            if kept!=addresses:
+                if not kept and not item.get('search'):continue
+                item['address']=kept
+        if item.get('type')=='route' and not cloud_v1_routes([item]):continue
+        if 'subnets' in item:
+            need(isinstance(item['subnets'],list),'invalid cloud-init v1 subnets')
+            subnets=[]
+            for subnet in item['subnets']:
+                need(isinstance(subnet,dict),'invalid cloud-init v1 subnet')
+                address=subnet.get('address',subnet.get('ip_address',''))
+                ipv6=subnet.get('type') in ('dhcp6','static6','ipv6_dhcpv6-stateful','ipv6_dhcpv6-stateless','ipv6_slaac') or is6(address)
+                dns=cloud_v1_dns(subnet.get('dns_nameservers',[]),split=True)
+                routes=cloud_v1_routes(subnet.get('routes',[]))
+                if ipv6:
+                    need(not (address and not is6(address) or dns or routes or subnet.get('dns_search') or
+                              subnet.get('gateway') and not is6(subnet['gateway'])),
+                         'cloud-init v1 IPv6 subnet carries IPv4 routes or DNS settings')
+                    continue
+                need(not is6(subnet.get('gateway','')),'cloud-init v1 IPv4 subnet has an IPv6 gateway')
+                if 'dns_nameservers' in subnet:subnet['dns_nameservers']=dns
+                if 'routes' in subnet:subnet['routes']=routes
+                subnets.append(subnet)
+            item['subnets']=subnets
+        cleaned.append(item)
+    desired['config']=cleaned
+    return desired
 
 def yaml_dump(v):
     import yaml
@@ -211,6 +277,12 @@ def ini_pairs(lines):
         m=re.match(r'\s*([^#;\s=]+)\s*=\s*(.*?)\s*(?:\n)?$',l)
         if m:d.setdefault(m[1],[]).append(m[2])
     return d
+def networkd_ipv4(key,value):
+    value=value.lower()
+    if value in ('yes','1','true','on','y','t','ipv4'):return 'ipv4'
+    if value in ('no','0','false','off','n','f','ipv6',''):return 'no'
+    if key=='LinkLocalAddressing' and value in ('fallback','ipv4-fallback'):return 'ipv4-fallback'
+    raise Stop('unsupported networkd '+key+' setting')
 def strip_networkd(text):
     out=[]
     for section,lines in unit_sections(text):
@@ -224,14 +296,25 @@ def strip_networkd(text):
             ws,k,v=m.groups()
             if section=='RoutingPolicyRule' and k=='Family' and v=='both':v='ipv4'
             if section=='Network':
-                if k in ('IPv6SendRA','DHCPPrefixDelegation') and v.lower() in ('yes','true','1'):raise Stop('IPv6 router/prefix delegation is a real dependency')
+                if k in ('IPv6SendRA','DHCPPrefixDelegation') and v.lower() in ('yes','true','1','on','y','t'):raise Stop('IPv6 router/prefix delegation is a real dependency')
                 if k in ('DNS','NTP') and any(is6(x) for x in v.split()):raise Stop('IPv6 '+k+' dependency in networkd')
                 if k in ('Address','Gateway') and is6(v):continue
-                if k=='DHCP':v='ipv4' if v.lower() in ('yes','true','1','ipv4') else 'no'
-                elif k=='LinkLocalAddressing':v='ipv4' if v.lower() in ('yes','true','1','ipv4') else 'no'
+                if k in ('DHCP','LinkLocalAddressing'):v=networkd_ipv4(k,v)
                 elif k in ('IPv6AcceptRA','IPv6LinkLocalAddressGenerationMode','IPv6PrivacyExtensions','IPv6Token','IPv6MTUBytes'):continue
             out.append(ws+k+'='+v+'\n')
     return ''.join(out)
+
+def cloud_networkd_projection(text):
+    sections={}
+    for section,lines in unit_sections(strip_networkd(text)):
+        if section in (None,'DHCPv6','IPv6AcceptRA','IPv6SendRA','IPv6PrefixDelegation'):continue
+        values=ini_pairs(lines)
+        if section=='Network':
+            for key in ('DHCP','LinkLocalAddressing'):
+                if values.get(key)==['no']:del values[key]
+        if values:sections.setdefault(section,[]).append(values)
+    return sections
+
 def strip_interfaces(text,inet4_names=None,ifup2=False,disable_attr=False,inline_policy=True):
     # Interface stanzas can be split across source files. IPv6-only links retain
     # a native manual stanza, including their MTU/L2 topology settings.
@@ -343,7 +426,7 @@ def cloud_netplan_renderings(net):
         return sorted(hashes)
 
 class Plan:
-    def __init__(self):self.changes={};self.watched={};self.actions=[];self.owners={};self.nm_devices={};self.nm_paths={};self.netplan_before=None;self.nm_catalog={}
+    def __init__(self):self.changes={};self.watched={};self.actions=[];self.owners={};self.nm_devices={};self.nm_paths={};self.netplan_before=None;self.nm_catalog={};self.cloud_cache=None
     def watch(self,path):
         if path not in self.watched:self.watched[path]=file_record(path)
         return self.watched[path]
@@ -379,14 +462,14 @@ class Plan:
         for folder in ('/usr/lib/systemd/network','/run/systemd/network','/etc/systemd/network'):
             for q in p(folder+'/'+name+'.d').glob('*.conf'):drop[q.name]='/'+str(q.relative_to(ROOT))
         files+= [v for k,v in sorted(drop.items())]
-        ll=False;dhcp=False
+        ll=dhcp='no'
         for src in files:
             rec=self.watch(src);text=base64.b64decode(rec['data']).decode()
             for sec,ls in unit_sections(text):
                 if sec=='Network':
                     kv=ini_pairs(ls)
-                    if 'DHCP' in kv:dhcp=kv['DHCP'][-1].lower() in ('yes','1','true','ipv4')
-                    if 'LinkLocalAddressing' in kv:ll=kv['LinkLocalAddressing'][-1].lower() in ('yes','1','true','ipv4')
+                    if 'DHCP' in kv:dhcp=networkd_ipv4('DHCP',kv['DHCP'][-1])
+                    if 'LinkLocalAddressing' in kv:ll=networkd_ipv4('LinkLocalAddressing',kv['LinkLocalAddressing'][-1])
             new=strip_networkd(text)
             if text!=new:
                 need(not src.startswith('/run/'),'runtime networkd drop-in has unknown writer: '+src)
@@ -394,7 +477,12 @@ class Plan:
                 if '.network.d/' in src:dst='/etc/systemd/network/'+name+'.d/'+pathlib.Path(src).name
                 self.put(dst,new.encode())
         target='/etc/systemd/network/'+name+'.d/zzzz-mist-ipv6.conf'
-        self.put(target,('[Network]\nIPv6AcceptRA=no\nLinkLocalAddressing='+('ipv4' if ll else 'no')+'\nDHCP='+('ipv4' if dhcp else 'no')+'\n').encode())
+        record=self.watch(target)
+        if record['exists']:
+            old=base64.b64decode(record['data'])
+            need(re.fullmatch(rb'\[Network\]\nIPv6AcceptRA=no\nLinkLocalAddressing=(?:no|ipv4|ipv4-fallback)\nDHCP=(?:no|ipv4)\n',old),
+                 'networkd policy drop-in path belongs to another owner: '+target)
+        self.put(target,('[Network]\nIPv6AcceptRA=no\nLinkLocalAddressing='+ll+'\nDHCP='+dhcp+'\n').encode())
         if iface:self.actions.append({'type':'networkd','iface':iface,'source':name})
     def nm(self):
         paths={r['path'] for r in self.nm_catalog.values() if r['path']}
@@ -421,7 +509,12 @@ class Plan:
             else:
                 if not any(sec=='connection' for sec,lines in unit_sections(text)):continue
                 need(path.startswith(('/etc/NetworkManager/system-connections/','/usr/lib/NetworkManager/system-connections/')),'NM profile location has no supported durable writer: '+path)
-                changed=strip_nm_keyfile(text);dst='/etc/NetworkManager/system-connections/'+pathlib.Path(path).name
+                dst='/etc/NetworkManager/system-connections/'+pathlib.Path(path).name
+                if path!=dst and self.watch(dst)['exists']:
+                    need(not any(r['path']==path for r in self.nm_catalog.values()),
+                         'NetworkManager profile collides with an administrative keyfile: '+dst)
+                    continue
+                changed=strip_nm_keyfile(text)
             self.put(dst,changed.encode(),rec['mode'] if dst==path else 0o600)
             matches_uuid=[u for u,r in self.nm_catalog.items() if r['path']==path]
             for ident in matches_uuid:
@@ -508,29 +601,46 @@ class Plan:
             with tempfile.TemporaryDirectory(prefix='mist-cloud-') as folder:
                 root=pathlib.Path(folder);source=root/'network.yaml';source.write_bytes(yaml_dump(net));out=root/'render'
                 run(['cloud-init','devel','net-convert','--network-data',str(source),'--kind','yaml','--directory',str(out),'--distro',distro.get('ID',''),'--output-kind',kind])
+                expected_networkd={
+                    path for path,record in self.watched.items()
+                    if kind=='networkd' and path.startswith('/etc/systemd/network/') and path.endswith('.network')
+                    and record['exists'] and ('cloud-init' in path or b'cloud-init' in base64.b64decode(record['data'])[:700].lower())
+                }
                 for q in out.rglob('*'):
                     if not q.is_file():continue
-                    path='/'+str(q.relative_to(out));original=self.watched.get(path)
+                    path='/'+q.relative_to(out).as_posix();original=self.watched.get(path)
                     if original is None or not original['exists']:continue
                     if 'cloud-init' not in path and b'cloud-init' not in base64.b64decode(original['data'])[:700].lower():continue
-                    self.changes.get(path,original)['owner_regeneration']={'boot':p('/proc/sys/kernel/random/boot_id').read_text().strip(),'sha256':[sha(q.read_bytes())]}
+                    data=q.read_bytes();planned=self.changes.get(path,original)
+                    if path in expected_networkd:
+                        need(cloud_networkd_projection(base64.b64decode(planned['data']).decode())==cloud_networkd_projection(data.decode()),
+                             'cloud-init networkd regeneration would change non-IPv6 settings: '+path)
+                        expected_networkd.remove(path)
+                    planned['owner_regeneration']={'boot':p('/proc/sys/kernel/random/boot_id').read_text().strip(),'sha256':[sha(data)]}
+                need(not expected_networkd,'cloud-init networkd regeneration omitted an existing owner file: '+', '.join(sorted(expected_networkd)))
 
+    def check_cloud_cache(self):
+        # The cache may be regenerated after reboot. Guard planning and apply,
+        # but do not make recovery depend on this derived provisioning input.
+        if self.cloud_cache is not None:
+            path,resolved,record=self.cloud_cache
+            need(p(path).resolve()==resolved and matches(path,record),'cloud-init network cache changed during the transaction')
     def cloud(self):
         # Persist IPv6 intent at the provisioning owner; never disable cloud-init.
         if p('/etc/cloud/cloud-init.disabled').exists() or not shutil.which('cloud-init'):return
         sources=[p('/etc/cloud/cloud.cfg')]+sorted(p('/etc/cloud/cloud.cfg.d').glob('*.cfg'))
-        cfg={}
+        net={};sources_network={}
         for q in sources:
             if q.exists():
-                path='/'+str(q.relative_to(ROOT));self.watch(path);doc=cloud_network(q.read_text())
-                cfg.update(doc)
-        net=cfg.get('network',{})
+                path='/'+q.relative_to(ROOT).as_posix();record=self.watch(path);doc=cloud_network(base64.b64decode(record['data']).decode())
+                if 'network' in doc:
+                    source=doc['network'];need(isinstance(source,dict),'invalid cloud-init system network configuration')
+                    sources_network[path]=source;net=merge_cloud_network(net,source)
         if net.get('config')=='disabled':return
         cmd=p('/proc/cmdline').read_text() if p('/proc/cmdline').exists() else ''
         if 'network-config=disabled' in cmd or 'cloud-init=disabled' in cmd:return
         need('network-config=' not in cmd or 'network-config=disabled' in cmd,'kernel network-config overrides cloud-init system config')
-        cached=p('/var/lib/cloud/instance/network-config.json')
-        if cached.exists() and net.get('version') not in (1,2):net=json.loads(cached.read_text())
+        cache_path='/var/lib/cloud/instance/network-config.json'
         if self.netplan_before is not None:
             cloud_sources=[r for path,r in self.watched.items() if path.startswith(('/etc/netplan/','/lib/netplan/')) and r['exists'] and ('cloud-init' in pathlib.Path(path).name or 'cloud-init' in base64.b64decode(r['data']).decode(errors='replace')[:700].lower())]
             if len(cloud_sources)==1:
@@ -538,9 +648,21 @@ class Plan:
                 # changed after boot; the old instance cache must not undo it.
                 net=yaml_load(base64.b64decode(cloud_sources[0]['data']).decode())['network']
             elif len(cloud_sources)>1:raise Stop('multiple cloud-init Netplan owner files require their provisioning source to be resolved')
+        if net.get('version') not in (1,2):
+            cached=p(cache_path);resolved=cached.resolve();record=file_record(cache_path)
+            self.cloud_cache=(cache_path,resolved,record)
+            if record['exists']:
+                try:net=json.loads(base64.b64decode(record['data']))
+                except (ValueError,UnicodeError) as error:raise Stop('invalid cloud-init network cache; configuration values omitted') from error
+                need(isinstance(net,dict),'invalid cloud-init network cache')
         if net.get('version')==2:
             desired=strip_netplan({'network':net})['network']
             target='/etc/cloud/cloud.cfg.d/zzzz-mist-ipv6.cfg';rec=self.watch(target)
+            sources_network[target]=desired
+            effective={}
+            for path in sorted(sources_network,key=lambda value:(value!='/etc/cloud/cloud.cfg',value)):
+                effective=merge_cloud_network(effective,sources_network[path])
+            need(effective==desired,'cloud-init v2 system merge would retain or override network settings; resolve the provisioning sources')
             if not rec['exists'] or yaml_load(base64.b64decode(rec['data']).decode())!={'network':desired}:
                 self.put(target,yaml_dump({'network':desired}))
             if self.netplan_before is not None and len(cloud_sources)==1:
@@ -552,21 +674,7 @@ class Plan:
                 # protected and arbitrary edits still block restoration.
                 self.changes.get(path,self.watched[path])['owner_regeneration']=marker
         elif net.get('version')==1:
-            d=copy.deepcopy(net)
-            cleaned=[]
-            for item in d.get('config',[]):
-                if item.get('type')=='nameserver':
-                    addresses=item.get('address',[])
-                    need(isinstance(addresses,(list,str)),'unsupported cloud-init v1 DNS address type')
-                    addresses=[addresses] if isinstance(addresses,str) else addresses
-                    need(all(isinstance(addr,str) for addr in addresses),'unsupported cloud-init v1 DNS address entry')
-                    kept=[addr for addr in addresses if not is6(addr)]
-                    if len(kept)!=len(addresses):
-                        if not kept and not item.get('search'):continue
-                        item['address']=kept
-                if 'subnets' in item:item['subnets']=[x for x in item['subnets'] if x.get('type') not in ('ipv6_dhcpv6-stateful','ipv6_dhcpv6-stateless','ipv6_slaac') and not is6(x.get('address',''))]
-                cleaned.append(item)
-            d['config']=cleaned
+            d=strip_cloud_v1(net)
             target='/etc/cloud/cloud.cfg.d/zzzz-mist-ipv6.cfg';rec=self.watch(target)
             if not rec['exists'] or yaml_load(base64.b64decode(rec['data']).decode())!={'network':d}:
                 self.put(target,yaml_dump({'network':d}))
@@ -575,6 +683,7 @@ class Plan:
             # No active owner data: do not invent a DHCP provisioning config.
             need(not any('cloud-init' in base64.b64decode(r.get('data','')).decode(errors='replace').lower() for r in self.watched.values() if r['path'].startswith(('/etc/netplan/','/etc/network/'))),'cloud-init generated config exists but owner network data is missing')
         if self.netplan_before is None and net.get('version') in (1,2):self.cloud_other_regeneration(desired if net['version']==2 else d)
+        self.check_cloud_cache()
 
 # Runtime and transactions follow below.
 def nl_rule6(op=34,payload=None,family=socket.AF_INET6):
@@ -677,7 +786,10 @@ def wait4(before,seconds=30):
     deadline=time.monotonic()+seconds;error=None
     while True:
         now=runtime()
-        try:verify4(before,now);return now
+        try:
+            verify4(before,now)
+            if before.get('require_operational_ipv4'):require_ipv4(now)
+            return now
         except Stop as e:error=e
         if time.monotonic()>=deadline:raise error
         time.sleep(0.5)
@@ -867,6 +979,7 @@ def discover():
 
 def apply_actions(actions):
     seen=set()
+    networkd_reload=False
     for a in actions:
         key=canonical(a)
         if key in seen:continue
@@ -875,12 +988,11 @@ def apply_actions(actions):
             if 'networkd_ifaces' not in a:run(['netplan','apply'],timeout=60) # legacy backup adapter
             else:
                 run(['netplan','generate'],timeout=30)
-                if a['networkd_ifaces']:
-                    run(['networkctl','reload']);run(['networkctl','reconfigure','--',*a['networkd_ifaces']],timeout=45)
+                networkd_reload=networkd_reload or bool(a['networkd_ifaces'])
                 if a.get('nm_devices'):
                     run(['nmcli','connection','reload'])
                     for name in a['nm_devices']:run(['nmcli','device','reapply',name],timeout=35)
-        elif t=='networkd':run(['networkctl','reload']);run(['networkctl','reconfigure',a['iface']],timeout=45)
+        elif t=='networkd':networkd_reload=True
         elif t=='nm':
             run(['nmcli','connection','reload'])
             for line in run(['nmcli','-t','-f','UUID,DEVICE','connection','show','--active']).stdout.splitlines():
@@ -888,6 +1000,8 @@ def apply_actions(actions):
                 if ident in a.get('uuids',[]) and name and name!='--':run(['nmcli','device','reapply',name],timeout=35)
         # ifupdown config changes are IPv6-only; sysctl applies them without cycling IPv4/DHCP.
         elif t=='ifupdown':run(['ifquery','--list'])
+    # networkd reload reconfigures interfaces affected by changed .network files.
+    if networkd_reload:run(['networkctl','reload'])
 
 def verify_nm(actions,restoring=False):
     for action in actions:
@@ -930,25 +1044,31 @@ def trusted_dir(d):
     d=pathlib.Path(d);need(d.is_absolute() and not d.is_symlink() and d.resolve().parent==p(STATE).resolve(),'invalid transaction path')
     st=d.stat();need(st.st_uid==0 and st.st_mode&0o077==0,'unsafe transaction permissions')
     return d
-def load(d):
+BACKUP_COPIES=('backup','backup-mirror')
+def load(d,expected_value=None):
     d=trusted_dir(d)
     errors=[]
-    for name in ('backup','backup-mirror'):
+    for name in BACKUP_COPIES:
         try:
             b=(d/(name+'.json')).read_bytes();expected=(d/(name+'.sha256')).read_text().strip();need(sha(b)==expected,'backup digest mismatch')
-            s=json.loads(b);need(s['version'] in ('2.1','2.2','2.3','2.3.1',VERSION),'backup version mismatch')
+            s=json.loads(b);need(s['version'] in ('2.1','2.2','2.3','2.3.1','2.3.2',VERSION),'backup version mismatch')
             need(s['machine']==p('/etc/machine-id').read_text().strip(),'backup belongs to a different machine')
             need(sha((d/'tool.sh').read_bytes())==s['tool_sha'],'backup tool digest mismatch')
             for path,r in s['files'].items():
                 need((path=='/etc/sysctl.conf' or path.startswith(('/etc/netplan/','/etc/systemd/network/','/etc/NetworkManager/system-connections/','/etc/network/','/etc/cloud/','/etc/sysctl.d/','/etc/sysconfig/network-scripts/'))) and '..' not in pathlib.Path(path).parts,'unsafe restore target')
                 if r['exists']:need(sha(base64.b64decode(r['data']))==r['sha'],'backup file digest mismatch: '+path)
-            return d,s
+            if expected_value is None:return d,s
+            need(b==expected_value,'backup does not match the prepared snapshot')
         except (OSError,ValueError,KeyError,Stop) as e:errors.append(str(e))
+    if expected_value is not None:
+        need(not errors,'backup verification failed before network write: '+'; '.join(errors))
+        return d,s
     raise Stop('both backup copies invalid: '+'; '.join(errors))
 def save_backup(d,value):
     data=canonical(value)
-    for name in ('backup','backup-mirror'):
+    for name in BACKUP_COPIES:
         atomic(d/(name+'.json'),data);atomic(d/(name+'.sha256'),sha(data).encode())
+    load(d,expected_value=data)
 
 def unit_paths(d):
     unit='mist-ipv6-'+d.name
@@ -957,14 +1077,20 @@ def arm(d,seconds):
     unit,service,timer=unit_paths(d);link=timer.parent/'timers.target.wants'/timer.name
     need(not service.exists() and not timer.exists() and not link.exists() and not link.is_symlink(),'rollback unit collision; foreign unit left unchanged')
     service_data=('[Unit]\nDescription=MIST IPv6 transaction rollback\nAfter=network.target\n[Service]\nType=oneshot\nExecStart=/bin/bash '+str(d/'tool.sh')+' --automatic-restore '+str(d)+'\nRestart=on-failure\nRestartSec=15s\nTimeoutStartSec=180s\n').encode()
-    timer_data=('[Unit]\nDescription=MIST IPv6 confirmation deadline and boot rollback\n[Timer]\nOnBootSec=0\nOnActiveSec='+str(seconds)+'s\nAccuracySec=1s\n[Install]\nWantedBy=timers.target\n').encode()
+    timer_data=('[Unit]\nDescription=MIST IPv6 confirmation deadline and boot rollback\n[Timer]\nOnBootSec=0\nOnActiveSec='+str(seconds)+'s\nOnUnitInactiveSec=15s\nAccuracySec=1s\n[Install]\nWantedBy=timers.target\n').encode()
     owned={}
     try:
         for q,data in ((service,service_data),(timer,timer_data)):
             atomic(q,data,0o644);owned[q.name]=sha(data)
         atomic(d/'watchdog.json',canonical(owned))
-        run(['systemctl','daemon-reload']);run(['systemctl','enable','--now',unit+'.timer'])
+        run(['systemctl','daemon-reload'])
+        for q in (service,timer):
+            loaded=run(['systemctl','show','-p','LoadState','-p','FragmentPath','-p','DropInPaths',q.name]).stdout.splitlines()
+            need('LoadState=loaded' in loaded and 'FragmentPath='+str(q) in loaded and 'DropInPaths=' in loaded,
+                 'independent rollback unit not loaded as written: '+q.name)
+        run(['systemctl','enable','--now',unit+'.timer'])
         need(active(unit+'.timer'),'independent rollback timer did not start')
+        need(link.is_symlink() and link.resolve()==timer.resolve(),'rollback timer is not enabled for boot')
         for folder in (timer.parent,link.parent):
             fd=os.open(folder,os.O_RDONLY);os.fsync(fd);os.close(fd)
     except BaseException:
@@ -987,6 +1113,7 @@ def disarm(d):
     run(['systemctl','daemon-reload'],False)
 
 def race_check(pl,expected=None):
+    pl.check_cloud_cache()
     need(pl.watch_globs()==pl.inventory,'configuration file set changed concurrently')
     for path,r in pl.watched.items():need(matches(path,r),'concurrent config modification: '+path)
 def route_command(verb,r,family='-6',elapsed=0):
@@ -1046,7 +1173,10 @@ def restore_runtime(before):
 def restore(d,automatic=False):
     d,s=load(d);view=read_status(d);status=view['status']
     need(not automatic or status!='unknown','status corrupt; automatic restore withheld to avoid undoing a committed transaction')
-    if status=='rolled_back' or (automatic and status in ('committed','prepared_failed')):return emit(status='RESTORE_NOOP',transaction=str(d),previous=status)
+    if status=='rolled_back' or (automatic and status in ('committed','prepared_failed','prepared')):
+        if automatic and status=='prepared':status_write(d,'prepared_failed')
+        if automatic and (d/'watchdog.json').exists():disarm(d)
+        return emit(status='RESTORE_NOOP',transaction=str(d),previous=status)
     # OnBootSec=0 also fires on initial activation. That wakeup must not
     # undo a healthy pending operation during its original monotonic window.
     if automatic and status=='awaiting_confirmation' and s['boot']==p('/proc/sys/kernel/random/boot_id').read_text().strip() and time.monotonic()<view.get('deadline_monotonic',0):
@@ -1103,6 +1233,7 @@ def restore(d,automatic=False):
         if 'rules4_raw' in s['before']:restore_rules6(s['before']['rules4_raw'],socket.AF_INET)
         if 'rules6_raw' in s['before']:restore_rules6(s['before']['rules6_raw'])
         now=wait4(s['before'])
+        if s['before'].get('dns_probe_ok'):run(['getent','ahostsv4','example.com'],timeout=12)
         for path,r in s['files'].items():need(matches(path,r),'restored file/metadata differs: '+path)
         need(now['knobs']==s['before']['knobs'],'restored sysctls differ')
         need(addr_set(now['addr6'],'inet6')==addr_set(s['before']['addr6'],'inet6'),'IPv6 address restore incomplete')
@@ -1145,6 +1276,7 @@ def apply(seconds):
     if not pl.changes and all(x.get('disable_ipv6')==1 for x in before['knobs'].values()) and not addr_set(before['addr6'],'inet6') and not before['routes6']:
         emit(status='NOOP',owners=pl.owners);return
     require_ipv4(before)
+    before['require_operational_ipv4']=True
     created_dirs=set()
     for path in pl.changes:
         parent=p(path).parent
@@ -1161,7 +1293,7 @@ def apply(seconds):
         s={'version':VERSION,'machine':p('/etc/machine-id').read_text().strip(),'boot':p('/proc/sys/kernel/random/boot_id').read_text().strip(),'before':before,
            'created_dirs':sorted(created_dirs,key=len,reverse=True),'files':{path:pl.watched[path] for path in pl.changes},'after':pl.changes,'actions':pl.actions,'watched':{path:{k:v for k,v in rec.items() if k!='data' or path in pl.changes} for path,rec in pl.watched.items()},'inventory':pl.inventory,'owners':pl.owners,'tool_sha':sha(b)}
         save_backup(d,s)
-        load(d);status_write(d,'prepared')
+        status_write(d,'prepared')
     except BaseException:
         status_write(d,'prepared_failed');raise
     armed=False;mutated=False
@@ -1172,7 +1304,7 @@ def apply(seconds):
         for path,r in pl.changes.items():
             need(matches(path,pl.watched[path]),'concurrent modification before write: '+path)
             def staged(temporary):
-                r['xattrs']=xattrs(temporary);save_backup(d,s);load(d)
+                r['xattrs']=xattrs(temporary);save_backup(d,s)
                 need(matches(path,pl.watched[path]),'concurrent modification before atomic replacement: '+path)
             mutated=True;atomic(p(path),base64.b64decode(r['data']),r['mode'],(r['uid'],r['gid']),(r['atime'],r['mtime']),attrs=pl.watched[path].get('xattrs'),before_replace=staged)
         apply_actions(pl.actions);verify_nm(pl.actions)
@@ -1188,14 +1320,18 @@ def apply(seconds):
         for name in knobs():set_knob(name,'disable_ipv6',1)
         verify_off(before)
         # Recheck every read input and our writes, including newly created files.
+        pl.check_cloud_cache()
         need(set(pl.watch_globs())==set(pl.inventory)|set(pl.changes),'configuration file set changed during apply')
         for path,r in pl.watched.items():need(matches(path,pl.changes.get(path,r)),'concurrent write during apply: '+path)
+        need(time.monotonic()<deadline,'apply deadline elapsed before confirmation')
+        need(active(unit_paths(d)[0]+'.timer'),'rollback watchdog stopped during apply')
         APPLY_DEADLINE=None
         status_write(d,'awaiting_confirmation',deadline_monotonic=deadline,boot=s['boot'],ipv4_policy_reinstated=restored_rules4)
         emit(status='AWAITING_CONFIRMATION',transaction=str(d),tool=str(d/'tool.sh'),machine=s['machine'],owners=pl.owners,seconds=max(0,int(deadline-time.monotonic())),watchdog_active=True,ipv4_policy_reinstated=restored_rules4)
     except BaseException as original:
         APPLY_DEADLINE=None
-        atomic(d/'apply-error.txt',str(original).encode())
+        try:atomic(d/'apply-error.txt',str(original).encode())
+        except Exception:pass
         if mutated:
             try:restore(d)
             except Exception as recovery:raise Stop('apply failed: '+str(original)+'; '+str(recovery)) from original
@@ -1267,8 +1403,8 @@ if __name__=='__main__':
     try:main()
     except Exception as e:emit(**dict(getattr(e,'details',{}),status='STOP',reason=str(e)));sys.exit(1)
 MIST_PYTHON
-MIST_ENGINE_EXACT_B202FF5CED11
-printf '%s  %s\n' 'b202ff5ced11285301d88a5ce04bcabf3526ae82ac31193e1131832b16a34e0f' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
+MIST_ENGINE_EXACT_ACE1354D44B5
+printf '%s  %s\n' 'ace1354d44b525d0d4bdfb3c8337ee837b03473a79f8d0d66025b09769b9396c' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
 chmod 700 "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 cat > "$mist_ipv6_ui_dir/display.py" <<'MIST_XSHELL_DISPLAY_EOF'
 #!/usr/bin/env python3
@@ -1296,7 +1432,7 @@ def main():
             say('  Сеть: ' + '; '.join(str(k) + ': ' + str(v) for k, v in value.items()), '36')
 
     if human:
-        say('\nMIST | IPv6 V2.3.2', '1;36')
+        say('\nMIST | IPv6 V2.3.3', '1;36')
         if os.environ.get('MIST_IPV6_VERIFIED_SHA'):
             say('[OK] Контрольная сумма исходника проверена', '32')
         if os.environ.get('MIST_IPV6_SAVED_SOURCE'):
@@ -1334,7 +1470,7 @@ def main():
             if transaction:
                 say('  Резервная копия: ' + str(transaction), '36')
             if isinstance(tool, str) and isinstance(transaction, str):
-                say('  После проверки доступности выполните одну команду:', '33')
+                say('  Откройте новое SSH-подключение по IPv4 и выполните:', '33')
                 confirm = ('bash ' + shlex.quote(tool) + ' --confirm ' + shlex.quote(transaction)
                            + ' | python3 ' + shlex.quote(os.path.abspath(__file__)))
                 say('  bash -o pipefail -c ' + shlex.quote(confirm), '1;36')
@@ -1388,7 +1524,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         raise SystemExit(130)
 MIST_XSHELL_DISPLAY_EOF
-export MIST_IPV6_VERIFIED_SHA=b202ff5ced11285301d88a5ce04bcabf3526ae82ac31193e1131832b16a34e0f
+export MIST_IPV6_VERIFIED_SHA=ace1354d44b525d0d4bdfb3c8337ee837b03473a79f8d0d66025b09769b9396c
 export MIST_IPV6_SAVED_SOURCE="$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 [ "$#" -gt 0 ] || set -- --apply
 bash "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" "$@" | python3 "$mist_ipv6_ui_dir/display.py"

@@ -2,12 +2,12 @@
 """Print a short immutable-download command for Xshell Send String."""
 import argparse,hashlib,pathlib,re
 R=pathlib.Path(__file__).resolve().parents[1]
-def command(ref):
+def command(ref,check=False):
     if not re.fullmatch('[0-9a-f]{40}',ref):raise ValueError('full Git commit SHA required')
     digest=hashlib.sha256((R/'ipv6.sh').read_bytes()).hexdigest()
     name='mist-ipv6-'+digest[:12]+'.sh'
-    return "(umask 077 && cd /root && curl -fLSs --retry 2 --max-time 60 https://raw.githubusercontent.com/InkoParadox/server-tools/"+ref+"/ipv6.sh -o "+name+" && echo '"+digest+"  "+name+"' | sha256sum -c - && bash "+name+")"
+    return "(umask 077 && cd /root && curl -fLSs --retry 2 --max-time 60 https://raw.githubusercontent.com/InkoParadox/server-tools/"+ref+"/ipv6.sh -o "+name+" && echo '"+digest+"  "+name+"' | sha256sum -c - && bash "+name+(" --check" if check else "")+")"
 if __name__=='__main__':
-    ap=argparse.ArgumentParser();ap.add_argument('--ref',required=True);ap.add_argument('--bash',action='store_true',help='print the same command without the literal Xshell suffix');ap.add_argument('--output',type=pathlib.Path);a=ap.parse_args();plain=command(a.ref);value=plain if a.bash else plain+'\\r'
+    ap=argparse.ArgumentParser();ap.add_argument('--ref',required=True);ap.add_argument('--check',action='store_true',help='run only the compatibility check');ap.add_argument('--bash',action='store_true',help='print the same command without the literal Xshell suffix');ap.add_argument('--output',type=pathlib.Path);a=ap.parse_args();plain=command(a.ref,a.check);value=plain if a.bash else plain+'\\r'
     if a.output:a.output.write_bytes(value.encode()+(b'\n' if a.bash else b''))
     else:print(value)

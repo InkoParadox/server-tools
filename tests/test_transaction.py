@@ -109,6 +109,31 @@ class Transaction(unittest.TestCase):
   d=self.apply();(d/'backup.json').write_bytes(b'CORRUPT')
   with contextlib.redirect_stdout(io.StringIO()):e.restore(d)
   self.assertEqual(e.p('/etc/netplan/test.yaml').read_bytes(),b'before')
+ def test_invalid_mirror_blocks_apply_before_arming(self):
+  atomic=e.atomic
+  def corrupt_mirror(q,data,*args,**kwargs):
+   return atomic(q,b'CORRUPT' if q.name=='backup-mirror.json' else data,*args,**kwargs)
+  self.patch('atomic',corrupt_mirror)
+  with self.assertRaisesRegex(e.Stop,'backup verification failed'):self.apply()
+  self.assertFalse(self.armed)
+  self.assertFalse(e.p(e.POLICY).exists())
+  self.assertEqual(e.p('/etc/netplan/test.yaml').read_bytes(),b'before')
+ def test_error_log_failure_does_not_prevent_restore(self):
+  atomic=e.atomic
+  def no_error_log(q,data,*args,**kwargs):
+   if q.name=='apply-error.txt':raise OSError('injected log failure')
+   return atomic(q,data,*args,**kwargs)
+  self.patch('atomic',no_error_log)
+  self.patch('verify_off',lambda b:e.need(False,'injected apply failure'))
+  with self.assertRaisesRegex(e.Stop,'injected apply failure'):self.apply()
+  self.assertFalse(self.armed)
+  self.assertEqual(e.p('/etc/netplan/test.yaml').read_bytes(),b'before')
+ def test_operational_ipv4_checked_even_with_unchanged_addresses(self):
+  d=self.apply()
+  _,backup=e.load(d)
+  self.rt['links'][0]['operstate']='DOWN'
+  with self.assertRaisesRegex(e.Stop,'operational interface'):
+   e.wait4(backup['before'],seconds=0)
  def test_both_bad_no_writes(self):
   d=self.apply()
   for name in ('backup.json','backup-mirror.json'):(d/name).write_bytes(b'CORRUPT')

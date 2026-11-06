@@ -23,7 +23,7 @@ def main():
             say('  Сеть: ' + '; '.join(str(k) + ': ' + str(v) for k, v in value.items()), '36')
 
     if human:
-        say('\nMIST | IPv6 V2.3.2', '1;36')
+        say('\nMIST | IPv6 V2.3.3', '1;36')
         if os.environ.get('MIST_IPV6_VERIFIED_SHA'):
             say('[OK] Контрольная сумма исходника проверена', '32')
         if os.environ.get('MIST_IPV6_SAVED_SOURCE'):
@@ -61,7 +61,7 @@ def main():
             if transaction:
                 say('  Резервная копия: ' + str(transaction), '36')
             if isinstance(tool, str) and isinstance(transaction, str):
-                say('  После проверки доступности выполните одну команду:', '33')
+                say('  Откройте новое SSH-подключение по IPv4 и выполните:', '33')
                 confirm = ('bash ' + shlex.quote(tool) + ' --confirm ' + shlex.quote(transaction)
                            + ' | python3 ' + shlex.quote(os.path.abspath(__file__)))
                 say('  bash -o pipefail -c ' + shlex.quote(confirm), '1;36')

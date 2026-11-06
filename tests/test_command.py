@@ -14,6 +14,7 @@ class CommandTests(unittest.TestCase):
         self.assertNotIn('$',plain);self.assertNotIn('\\',plain)
         digest=hashlib.sha256((R/'ipv6.sh').read_bytes()).hexdigest()
         self.assertIn(digest,plain);self.assertIn('/'+REF+'/ipv6.sh',plain)
+        self.assertTrue(command.command(REF,check=True).endswith(' --check)'))
         for ref in ('main','7'*39,REF+';id'):
             with self.subTest(ref=ref),self.assertRaises(ValueError):command.command(ref)
         with tempfile.TemporaryDirectory() as folder:

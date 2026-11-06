@@ -31,7 +31,13 @@ class Pure(unittest.TestCase):
   src='[Match]\nName=ens*\n[Network]\nDHCP=yes\nLinkLocalAddressing=yes\nDNS=1.1.1.1\nMTUBytes=1400\nAddress=10.0.0.2/24\nAddress=2001:db8::2/64\n[Route]\nDestination=::/0\nGateway=2001:db8::1\n[Route]\nGateway=10.0.0.1\nMetric=300\n'
   d=e.strip_networkd(src);self.assertIn('DHCP=ipv4',d);self.assertIn('LinkLocalAddressing=ipv4',d);self.assertIn('MTUBytes=1400',d);self.assertIn('Metric=300',d);self.assertNotIn('2001:',d)
  def test_networkd_router_dependency(self):
-  with self.assertRaises(e.Stop):e.strip_networkd('[Network]\nIPv6SendRA=yes\n')
+  for value in ('yes','on','y','t'):
+   with self.subTest(value=value),self.assertRaises(e.Stop):e.strip_networkd('[Network]\nIPv6SendRA='+value+'\n')
+ def test_networkd_preserves_ipv4_aliases_and_fallback(self):
+  for alias in ('on','y','t','YES'):
+   with self.subTest(alias=alias):
+    text='[Network]\nDHCP='+alias+'\nLinkLocalAddressing=fallback\n'
+    self.assertEqual(e.strip_networkd(text),'[Network]\nDHCP=ipv4\nLinkLocalAddressing=ipv4-fallback\n')
  def test_ifupdown(self):
   src='source /etc/network/interfaces.d/*\nauto eth0\niface eth0 inet dhcp\n mtu 1400\niface eth0 inet6 static\n address 2001:db8::2/64\n gateway 2001:db8::1\n'
   self.assertEqual(e.strip_interfaces(src),'source /etc/network/interfaces.d/*\nauto eth0\niface eth0 inet dhcp\n mtu 1400\n')
@@ -91,6 +97,21 @@ class Pure(unittest.TestCase):
  def test_keyfile_implicit_ipv6_default(self):
   self.assertIn('method=disabled',e.strip_nm_keyfile('[connection]\ntype=ethernet\n[ipv4]\nmethod=auto\n'))
   self.assertNotIn('[ipv6]',e.strip_nm_keyfile('[connection]\ntype=ethernet\nmaster=br0\nslave-type=bridge\n'))
+ def test_vendor_keyfile_does_not_overwrite_administrative_profile(self):
+  old=e.ROOT
+  try:
+   with tempfile.TemporaryDirectory() as tmp:
+    e.ROOT=pathlib.Path(tmp)
+    admin='/etc/NetworkManager/system-connections/wired.nmconnection'
+    vendor='/usr/lib/NetworkManager/system-connections/wired.nmconnection'
+    for path,method in ((admin,'manual'),(vendor,'auto')):
+     q=e.p(path);q.parent.mkdir(parents=True)
+     q.write_text('[connection]\ntype=ethernet\n[ipv4]\nmethod='+method+'\n')
+    pl=e.Plan();pl.nm()
+    self.assertIn(b'method=manual',base64.b64decode(pl.changes[admin]['data']))
+    pl=e.Plan();pl.nm_catalog={'vendor':{'path':vendor,'method':'auto'}}
+    with self.assertRaisesRegex(e.Stop,'collides'):pl.nm()
+  finally:e.ROOT=old
  def test_multicast_slot_is_interface_scoped(self):
   a={'type':'multicast','dst':'ff00::/8','dev':'eth0','table':'local','metric':256};b=dict(a,dev='br0');self.assertNotEqual(e.route_slot(a),e.route_slot(b))
   a={'dst':'default','gateway':'10.0.0.1','dev':'a'};b=dict(a,dev='b');self.assertEqual(e.route_slot(a),e.route_slot(b))
