@@ -1199,6 +1199,16 @@ def restore(d,automatic=False):
                 directory.rmdir()
         for name in ('all','default'):
             for k,v in s['before']['knobs'][name].items():set_knob(name,k,v)
+        current_links={v['ifname']:v for v in jr('ip','-j','-d','link','show')}
+        for link in s['before']['links']:
+            name=link['ifname']
+            if 'UP' not in link.get('flags',[]) or s['owners'].get(name,'') not in ('networkd','netplan/networkd','netplan/NetworkManager','NetworkManager','ifupdown'):continue
+            nowlink=current_links.get(name)
+            need(nowlink,'interface missing during restore: '+name)
+            if 'UP' in nowlink.get('flags',[]):continue
+            need(link.get('ifindex') is not None and link['ifindex']==nowlink.get('ifindex') and
+                 link.get('link_type')==nowlink.get('link_type'),'refusing to enable a replaced interface: '+name)
+            run(['ip','link','set','dev',name,'up'])
         apply_actions(s['actions']);verify_nm(s['actions'],True)
         current_links={v['ifname']:v for v in jr('ip','-j','-d','link','show')}
         for link in s['before']['links']:

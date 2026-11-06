@@ -134,6 +134,25 @@ class Transaction(unittest.TestCase):
   self.rt['links'][0]['operstate']='DOWN'
   with self.assertRaisesRegex(e.Stop,'operational interface'):
    e.wait4(backup['before'],seconds=0)
+ def test_restore_raises_managed_link_before_reconfiguring(self):
+  self.b['links'][0].update(ifindex=8,link_type='ether')
+  self.rt=copy.deepcopy(self.b)
+  discover=e.discover
+  def managed():
+   plan,before=discover()
+   plan.owners['eth.123']='networkd'
+   return plan,before
+  self.patch('discover',managed)
+  d=self.apply()
+  link=self.rt['links'][0]
+  link.update(flags=[],operstate='DOWN')
+  def run(args,**kwargs):
+   self.assertEqual(args,['ip','link','set','dev','eth.123','up'])
+   link.update(flags=['UP'],operstate='UP')
+  self.patch('run',run)
+  self.patch('apply_actions',lambda actions:self.assertIn('UP',link['flags']))
+  with contextlib.redirect_stdout(io.StringIO()):e.restore(d)
+  self.assertEqual(e.read_status(d)['status'],'rolled_back')
  def test_both_bad_no_writes(self):
   d=self.apply()
   for name in ('backup.json','backup-mirror.json'):(d/name).write_bytes(b'CORRUPT')

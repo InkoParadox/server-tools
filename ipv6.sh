@@ -5,7 +5,7 @@ export PYTHONUTF8=1
 command -v python3 >/dev/null || { printf '\033[1;31mSTOP: python3 required\033[0m\n' >&2; exit 1; }
 umask 077
 mist_ipv6_ui_dir=$(mktemp -d /root/mist-ipv6-xshell-XXXXXXXX)
-cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_ACE1354D44B5'
+cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_D90EF494A441'
 #!/usr/bin/env bash
 set -eu
 export PYTHONUTF8=1
@@ -1213,6 +1213,16 @@ def restore(d,automatic=False):
                 directory.rmdir()
         for name in ('all','default'):
             for k,v in s['before']['knobs'][name].items():set_knob(name,k,v)
+        current_links={v['ifname']:v for v in jr('ip','-j','-d','link','show')}
+        for link in s['before']['links']:
+            name=link['ifname']
+            if 'UP' not in link.get('flags',[]) or s['owners'].get(name,'') not in ('networkd','netplan/networkd','netplan/NetworkManager','NetworkManager','ifupdown'):continue
+            nowlink=current_links.get(name)
+            need(nowlink,'interface missing during restore: '+name)
+            if 'UP' in nowlink.get('flags',[]):continue
+            need(link.get('ifindex') is not None and link['ifindex']==nowlink.get('ifindex') and
+                 link.get('link_type')==nowlink.get('link_type'),'refusing to enable a replaced interface: '+name)
+            run(['ip','link','set','dev',name,'up'])
         apply_actions(s['actions']);verify_nm(s['actions'],True)
         current_links={v['ifname']:v for v in jr('ip','-j','-d','link','show')}
         for link in s['before']['links']:
@@ -1403,8 +1413,8 @@ if __name__=='__main__':
     try:main()
     except Exception as e:emit(**dict(getattr(e,'details',{}),status='STOP',reason=str(e)));sys.exit(1)
 MIST_PYTHON
-MIST_ENGINE_EXACT_ACE1354D44B5
-printf '%s  %s\n' 'ace1354d44b525d0d4bdfb3c8337ee837b03473a79f8d0d66025b09769b9396c' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
+MIST_ENGINE_EXACT_D90EF494A441
+printf '%s  %s\n' 'd90ef494a441d8a4cad499d0f6d79bac73054a24382996719c8cfb62e24ac597' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
 chmod 700 "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 cat > "$mist_ipv6_ui_dir/display.py" <<'MIST_XSHELL_DISPLAY_EOF'
 #!/usr/bin/env python3
@@ -1524,7 +1534,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         raise SystemExit(130)
 MIST_XSHELL_DISPLAY_EOF
-export MIST_IPV6_VERIFIED_SHA=ace1354d44b525d0d4bdfb3c8337ee837b03473a79f8d0d66025b09769b9396c
+export MIST_IPV6_VERIFIED_SHA=d90ef494a441d8a4cad499d0f6d79bac73054a24382996719c8cfb62e24ac597
 export MIST_IPV6_SAVED_SOURCE="$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 [ "$#" -gt 0 ] || set -- --apply
 bash "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" "$@" | python3 "$mist_ipv6_ui_dir/display.py"
