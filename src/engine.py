@@ -3,7 +3,7 @@
 import argparse,base64,copy,ctypes,errno,fcntl,socket,struct,collections,glob,hashlib,ipaddress,json,os,pathlib,re,shlex,shutil,signal,stat,subprocess,sys,tempfile,time,uuid
 need_python = sys.version_info >= (3,8)
 if not need_python:raise SystemExit('STOP: Python >=3.8 required; no package installed')
-VERSION='2.3.1'
+VERSION='2.3.2'
 APPLY_DEADLINE=None
 ROOT=pathlib.Path('/')
 STATE='/var/lib/mist-ipv6'
@@ -539,9 +539,20 @@ class Plan:
                 self.changes.get(path,self.watched[path])['owner_regeneration']=marker
         elif net.get('version')==1:
             d=copy.deepcopy(net)
+            cleaned=[]
             for item in d.get('config',[]):
-                if item.get('type')=='nameserver':need(not any(is6(x) for x in item.get('address',[])),'IPv6 DNS from cloud-init')
+                if item.get('type')=='nameserver':
+                    addresses=item.get('address',[])
+                    need(isinstance(addresses,(list,str)),'unsupported cloud-init v1 DNS address type')
+                    addresses=[addresses] if isinstance(addresses,str) else addresses
+                    need(all(isinstance(addr,str) for addr in addresses),'unsupported cloud-init v1 DNS address entry')
+                    kept=[addr for addr in addresses if not is6(addr)]
+                    if len(kept)!=len(addresses):
+                        if not kept and not item.get('search'):continue
+                        item['address']=kept
                 if 'subnets' in item:item['subnets']=[x for x in item['subnets'] if x.get('type') not in ('ipv6_dhcpv6-stateful','ipv6_dhcpv6-stateless','ipv6_slaac') and not is6(x.get('address',''))]
+                cleaned.append(item)
+            d['config']=cleaned
             target='/etc/cloud/cloud.cfg.d/zzzz-mist-ipv6.cfg';rec=self.watch(target)
             if not rec['exists'] or yaml_load(base64.b64decode(rec['data']).decode())!={'network':d}:
                 self.put(target,yaml_dump({'network':d}))
@@ -911,7 +922,7 @@ def load(d):
     for name in ('backup','backup-mirror'):
         try:
             b=(d/(name+'.json')).read_bytes();expected=(d/(name+'.sha256')).read_text().strip();need(sha(b)==expected,'backup digest mismatch')
-            s=json.loads(b);need(s['version'] in ('2.1','2.2','2.3',VERSION),'backup version mismatch')
+            s=json.loads(b);need(s['version'] in ('2.1','2.2','2.3','2.3.1',VERSION),'backup version mismatch')
             need(s['machine']==p('/etc/machine-id').read_text().strip(),'backup belongs to a different machine')
             need(sha((d/'tool.sh').read_bytes())==s['tool_sha'],'backup tool digest mismatch')
             for path,r in s['files'].items():

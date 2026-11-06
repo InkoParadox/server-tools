@@ -5,7 +5,7 @@ export PYTHONUTF8=1
 command -v python3 >/dev/null || { printf '\033[1;31mSTOP: python3 required\033[0m\n' >&2; exit 1; }
 umask 077
 mist_ipv6_ui_dir=$(mktemp -d /root/mist-ipv6-xshell-XXXXXXXX)
-cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_7092EE04FE6D'
+cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_B202FF5CED11'
 #!/usr/bin/env bash
 set -eu
 export PYTHONUTF8=1
@@ -17,7 +17,7 @@ exec python3 - "$@" <<'MIST_PYTHON'
 import argparse,base64,copy,ctypes,errno,fcntl,socket,struct,collections,glob,hashlib,ipaddress,json,os,pathlib,re,shlex,shutil,signal,stat,subprocess,sys,tempfile,time,uuid
 need_python = sys.version_info >= (3,8)
 if not need_python:raise SystemExit('STOP: Python >=3.8 required; no package installed')
-VERSION='2.3.1'
+VERSION='2.3.2'
 APPLY_DEADLINE=None
 ROOT=pathlib.Path('/')
 STATE='/var/lib/mist-ipv6'
@@ -553,9 +553,20 @@ class Plan:
                 self.changes.get(path,self.watched[path])['owner_regeneration']=marker
         elif net.get('version')==1:
             d=copy.deepcopy(net)
+            cleaned=[]
             for item in d.get('config',[]):
-                if item.get('type')=='nameserver':need(not any(is6(x) for x in item.get('address',[])),'IPv6 DNS from cloud-init')
+                if item.get('type')=='nameserver':
+                    addresses=item.get('address',[])
+                    need(isinstance(addresses,(list,str)),'unsupported cloud-init v1 DNS address type')
+                    addresses=[addresses] if isinstance(addresses,str) else addresses
+                    need(all(isinstance(addr,str) for addr in addresses),'unsupported cloud-init v1 DNS address entry')
+                    kept=[addr for addr in addresses if not is6(addr)]
+                    if len(kept)!=len(addresses):
+                        if not kept and not item.get('search'):continue
+                        item['address']=kept
                 if 'subnets' in item:item['subnets']=[x for x in item['subnets'] if x.get('type') not in ('ipv6_dhcpv6-stateful','ipv6_dhcpv6-stateless','ipv6_slaac') and not is6(x.get('address',''))]
+                cleaned.append(item)
+            d['config']=cleaned
             target='/etc/cloud/cloud.cfg.d/zzzz-mist-ipv6.cfg';rec=self.watch(target)
             if not rec['exists'] or yaml_load(base64.b64decode(rec['data']).decode())!={'network':d}:
                 self.put(target,yaml_dump({'network':d}))
@@ -925,7 +936,7 @@ def load(d):
     for name in ('backup','backup-mirror'):
         try:
             b=(d/(name+'.json')).read_bytes();expected=(d/(name+'.sha256')).read_text().strip();need(sha(b)==expected,'backup digest mismatch')
-            s=json.loads(b);need(s['version'] in ('2.1','2.2','2.3',VERSION),'backup version mismatch')
+            s=json.loads(b);need(s['version'] in ('2.1','2.2','2.3','2.3.1',VERSION),'backup version mismatch')
             need(s['machine']==p('/etc/machine-id').read_text().strip(),'backup belongs to a different machine')
             need(sha((d/'tool.sh').read_bytes())==s['tool_sha'],'backup tool digest mismatch')
             for path,r in s['files'].items():
@@ -1256,8 +1267,8 @@ if __name__=='__main__':
     try:main()
     except Exception as e:emit(**dict(getattr(e,'details',{}),status='STOP',reason=str(e)));sys.exit(1)
 MIST_PYTHON
-MIST_ENGINE_EXACT_7092EE04FE6D
-printf '%s  %s\n' '7092ee04fe6de6e5da5b9780d8785eac9c9a14e70ec8bbff61a89a4055720142' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
+MIST_ENGINE_EXACT_B202FF5CED11
+printf '%s  %s\n' 'b202ff5ced11285301d88a5ce04bcabf3526ae82ac31193e1131832b16a34e0f' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
 chmod 700 "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 cat > "$mist_ipv6_ui_dir/display.py" <<'MIST_XSHELL_DISPLAY_EOF'
 #!/usr/bin/env python3
@@ -1285,7 +1296,7 @@ def main():
             say('  Сеть: ' + '; '.join(str(k) + ': ' + str(v) for k, v in value.items()), '36')
 
     if human:
-        say('\nMIST | IPv6 V2.3', '1;36')
+        say('\nMIST | IPv6 V2.3.2', '1;36')
         if os.environ.get('MIST_IPV6_VERIFIED_SHA'):
             say('[OK] Контрольная сумма исходника проверена', '32')
         if os.environ.get('MIST_IPV6_SAVED_SOURCE'):
@@ -1377,7 +1388,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         raise SystemExit(130)
 MIST_XSHELL_DISPLAY_EOF
-export MIST_IPV6_VERIFIED_SHA=7092ee04fe6de6e5da5b9780d8785eac9c9a14e70ec8bbff61a89a4055720142
+export MIST_IPV6_VERIFIED_SHA=b202ff5ced11285301d88a5ce04bcabf3526ae82ac31193e1131832b16a34e0f
 export MIST_IPV6_SAVED_SOURCE="$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 [ "$#" -gt 0 ] || set -- --apply
 bash "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" "$@" | python3 "$mist_ipv6_ui_dir/display.py"
