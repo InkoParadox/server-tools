@@ -258,7 +258,8 @@ class ChronyTests(unittest.TestCase):
         tool = self.root / 'engine.sh'
         tool.write_bytes(self.engine)
         tool.chmod(0o700)
-        plan = type('PlanFixture', (), {'changes': {}, 'owners': {}, 'watched': {}, 'actions': [], 'inventory': []})()
+        plan = self.api['Plan']()
+        plan.inventory = []
         restored, armed, events, writes = [], [], [], []
 
         def apply_actions(actions):
