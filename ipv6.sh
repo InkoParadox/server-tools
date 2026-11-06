@@ -5,7 +5,7 @@ export PYTHONUTF8=1
 command -v python3 >/dev/null || { printf '\033[1;31mSTOP: python3 required\033[0m\n' >&2; exit 1; }
 umask 077
 mist_ipv6_ui_dir=$(mktemp -d /root/mist-ipv6-xshell-XXXXXXXX)
-cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_D90EF494A441'
+cat > "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" <<'MIST_ENGINE_EXACT_8EEE9405CE30'
 #!/usr/bin/env bash
 set -eu
 export PYTHONUTF8=1
@@ -17,7 +17,7 @@ exec python3 - "$@" <<'MIST_PYTHON'
 import argparse,base64,copy,ctypes,errno,fcntl,socket,struct,collections,glob,hashlib,ipaddress,json,os,pathlib,re,shlex,shutil,signal,stat,subprocess,sys,tempfile,time,uuid
 need_python = sys.version_info >= (3,8)
 if not need_python:raise SystemExit('STOP: Python >=3.8 required; no package installed')
-VERSION='2.3.3'
+VERSION='2.3.4'
 APPLY_DEADLINE=None
 ROOT=pathlib.Path('/')
 STATE='/var/lib/mist-ipv6'
@@ -129,7 +129,7 @@ def matches(path,record):
     st=q.stat();actual={'mode':stat.S_IMODE(st.st_mode),'uid':st.st_uid,'gid':st.st_gid,'mtime':st.st_mtime_ns}
     # Netplan's systemd generator recreates these outputs on daemon-reload,
     # including our watchdog setup. Keep content/permissions/owner/ACL checks.
-    if new_boot or (path.startswith('/run/systemd/network/10-netplan-') and path.endswith('.network')):actual.pop('mtime')
+    if new_boot or (path.startswith('/run/systemd/network/10-netplan-') and path.endswith(('.network','.link','.netdev'))):actual.pop('mtime')
     return all(actual[k]==record[k] for k in actual if k in record) and ('xattrs' not in record or xattrs(q)==record['xattrs'])
 
 def yaml_load(text):
@@ -404,7 +404,7 @@ def nm_catalog():
         result[ident]={'path':prop('Filename'),'flags':int(prop('Flags')),'method':run(['nmcli','-g','ipv6.method','connection','show',ident],False).stdout.strip()}
     return result
 
-def cloud_netplan_renderings(net):
+def cloud_netplan_outputs(net):
     # Capture exact outputs of the installed provisioning renderer and native
     # Netplan writer. Arbitrary semantically equal YAML is NOT accepted.
     distro={}
@@ -416,17 +416,21 @@ def cloud_netplan_renderings(net):
         run(['cloud-init','devel','net-convert','--network-data',str(source),'--kind','yaml','--directory',str(out),'--distro',distro.get('ID',''),'--output-kind','netplan'])
         files=list((out/'etc/netplan').glob('*.yaml'))
         need(len(files)==1,'cloud-init offline renderer produced an unexpected Netplan file set')
-        generated=files[0];content=generated.read_bytes()
-        need(yaml_load(content.decode())=={'network':net},'cloud-init renderer changes settings beyond the planned network intent')
-        hashes={sha(content)}
+        generated=files[0];content=generated.read_bytes();rendered=yaml_load(content.decode())
+        if net['version']==2:
+            need(rendered=={'network':net},'cloud-init renderer changes settings beyond the planned network intent')
+        outputs={content}
         run(['netplan','set','--root-dir',str(out),'--origin-hint',generated.stem,'network.version=2'])
         content=generated.read_bytes()
-        need(yaml_load(content.decode())=={'network':net},'Netplan native writer changes the cloud-init network intent')
-        hashes.add(sha(content))
-        return sorted(hashes)
+        need(yaml_load(content.decode())==rendered,'Netplan native writer changes the cloud-init network intent')
+        outputs.add(content)
+        return generated.name,sorted(outputs)
+
+def cloud_netplan_renderings(net):
+    return sorted(sha(data) for data in cloud_netplan_outputs(net)[1])
 
 class Plan:
-    def __init__(self):self.changes={};self.watched={};self.actions=[];self.owners={};self.nm_devices={};self.nm_paths={};self.netplan_before=None;self.nm_catalog={};self.cloud_cache=None
+    def __init__(self):self.changes={};self.watched={};self.actions=[];self.owners={};self.nm_devices={};self.nm_paths={};self.netplan_before=None;self.nm_catalog={};self.cloud_cache=None;self.rollback_netplan=None
     def watch(self,path):
         if path not in self.watched:self.watched[path]=file_record(path)
         return self.watched[path]
@@ -618,6 +622,47 @@ class Plan:
                         expected_networkd.remove(path)
                     planned['owner_regeneration']={'boot':p('/proc/sys/kernel/random/boot_id').read_text().strip(),'sha256':[sha(data)]}
                 need(not expected_networkd,'cloud-init networkd regeneration omitted an existing owner file: '+', '.join(sorted(expected_networkd)))
+        if 'networkd' in owners and p('/etc/netplan/50-cloud-init.yaml').exists():
+            self.cloud_shadow_netplan(net)
+
+    def cloud_shadow_netplan(self,net):
+        # Cloud-init can own a Netplan fallback even when a direct .network
+        # file wins. Predict its exact boot output without editing that fallback.
+        path='/etc/netplan/50-cloud-init.yaml'
+        name,outputs=cloud_netplan_outputs(net)
+        need(name==pathlib.PurePosixPath(path).name,'unexpected cloud-init Netplan fallback name')
+        original=self.watch(path)
+        sources={}
+        for folder in ('/lib/netplan','/etc/netplan','/run/netplan'):
+            for q in p(folder).glob('*.yaml'):
+                source='/'+q.relative_to(ROOT).as_posix()
+                record=self.watch(source)
+                sources[source]=base64.b64decode(record['data'])
+        need('/run/netplan/'+name not in sources,'runtime Netplan source overrides the cloud-init fallback')
+
+        def generate(content):
+            with tempfile.TemporaryDirectory(prefix='mist-netplan-') as folder:
+                root=pathlib.Path(folder)
+                for source,data in sources.items():
+                    q=root/source.lstrip('/');q.parent.mkdir(parents=True,exist_ok=True)
+                    q.write_bytes(content if source==path else data);q.chmod(0o600)
+                run(['netplan','generate','--root-dir',folder],timeout=30)
+                return {'/'+q.relative_to(root).as_posix():sha(q.read_bytes())
+                        for q in (root/'run/systemd/network').glob('10-netplan-*') if q.is_file()}
+
+        before=generate(sources[path])
+        need(before,'no networkd units for the cloud-init Netplan fallback')
+        hashes={target:set() for target in before}
+        for content in outputs:
+            generated=generate(content)
+            need(generated.keys()==before.keys(),'cloud-init would change the Netplan fallback unit set')
+            for target,digest in generated.items():hashes[target].add(digest)
+        boot=p('/proc/sys/kernel/random/boot_id').read_text().strip()
+        for target,digest in before.items():
+            record=self.watch(target)
+            need(record['sha']==digest,'Netplan fallback unit differs from its source: '+target)
+            record['owner_regeneration']={'boot':boot,'sha256':sorted(hashes[target])}
+        self.rollback_netplan=dict(original,owner_regeneration={'boot':boot,'sha256':sorted(sha(data) for data in outputs)})
 
     def check_cloud_cache(self):
         # The cache may be regenerated after reboot. Guard planning and apply,
@@ -1051,7 +1096,7 @@ def load(d,expected_value=None):
     for name in BACKUP_COPIES:
         try:
             b=(d/(name+'.json')).read_bytes();expected=(d/(name+'.sha256')).read_text().strip();need(sha(b)==expected,'backup digest mismatch')
-            s=json.loads(b);need(s['version'] in ('2.1','2.2','2.3','2.3.1','2.3.2',VERSION),'backup version mismatch')
+            s=json.loads(b);need(s['version'] in ('2.1','2.2','2.3','2.3.1','2.3.2','2.3.3',VERSION),'backup version mismatch')
             need(s['machine']==p('/etc/machine-id').read_text().strip(),'backup belongs to a different machine')
             need(sha((d/'tool.sh').read_bytes())==s['tool_sha'],'backup tool digest mismatch')
             for path,r in s['files'].items():
@@ -1190,6 +1235,7 @@ def restore(d,automatic=False):
     if not have<=allowed or not set(s['inventory'])<=have:errors.append('configuration file set changed since transaction')
     for path,r in s['watched'].items():
         if path not in s['files'] and not matches(path,r):errors.append('restore read-input conflict: '+path)
+    refresh_netplan=bool(s.get('rollback_netplan') and s['boot']!=p('/proc/sys/kernel/random/boot_id').read_text().strip())
     for path,r in s['files'].items():
         if not (matches(path,r) or matches(path,s['after'][path])):errors.append('restore target conflict: '+path)
     if errors:
@@ -1200,11 +1246,13 @@ def restore(d,automatic=False):
         try:
             need(matches(path,r) or matches(path,s['after'][path]),'concurrent modification blocks restore: '+path)
             if r['exists']:
-                if not matches(path,r):atomic(p(path),base64.b64decode(r['data']),r['mode'],(r['uid'],r['gid']),(r['atime'],r['mtime']),attrs=r.get('xattrs'))
+                if not matches(path,r):
+                    atomic(p(path),base64.b64decode(r['data']),r['mode'],(r['uid'],r['gid']),(r['atime'],r['mtime']),attrs=r.get('xattrs'))
             elif p(path).exists():p(path).unlink()
         except Exception as e:errors.append(str(e))
     try:
         need(not errors,'config conflict; manager reconfiguration withheld')
+        if refresh_netplan:run(['netplan','generate'],timeout=30)
         for path in s.get('created_dirs',[]):
             need(path.startswith(('/etc/netplan','/etc/systemd/network','/etc/NetworkManager/system-connections','/etc/network','/etc/cloud','/etc/sysctl.d','/etc/sysconfig/network-scripts')) and '..' not in pathlib.Path(path).parts,'invalid created-directory record')
             directory=p(path)
@@ -1245,6 +1293,11 @@ def restore(d,automatic=False):
         now=wait4(s['before'])
         if s['before'].get('dns_probe_ok'):run(['getent','ahostsv4','example.com'],timeout=12)
         for path,r in s['files'].items():need(matches(path,r),'restored file/metadata differs: '+path)
+        if refresh_netplan:
+            for path,r in s['watched'].items():
+                if path.startswith('/run/systemd/network/10-netplan-') and 'owner_regeneration' in r:
+                    original=dict(r);original.pop('owner_regeneration')
+                    need(matches(path,original),'Netplan fallback unit not restored: '+path)
         need(now['knobs']==s['before']['knobs'],'restored sysctls differ')
         need(addr_set(now['addr6'],'inet6')==addr_set(s['before']['addr6'],'inet6'),'IPv6 address restore incomplete')
         need(route_set(now['routes6'])==route_set(s['before']['routes6']),'IPv6 route restore incomplete')
@@ -1300,8 +1353,14 @@ def apply(seconds):
     try:
         status_write(d,'prepared_failed') # no network writes until backup is complete and armed
         atomic(d/'tool.sh',b,0o700)
+        files={path:pl.watched[path] for path in pl.changes};after=dict(pl.changes)
+        shadow=pl.rollback_netplan
+        if shadow:
+            files[shadow['path']]=pl.watched[shadow['path']]
+            after[shadow['path']]=shadow
         s={'version':VERSION,'machine':p('/etc/machine-id').read_text().strip(),'boot':p('/proc/sys/kernel/random/boot_id').read_text().strip(),'before':before,
-           'created_dirs':sorted(created_dirs,key=len,reverse=True),'files':{path:pl.watched[path] for path in pl.changes},'after':pl.changes,'actions':pl.actions,'watched':{path:{k:v for k,v in rec.items() if k!='data' or path in pl.changes} for path,rec in pl.watched.items()},'inventory':pl.inventory,'owners':pl.owners,'tool_sha':sha(b)}
+           'created_dirs':sorted(created_dirs,key=len,reverse=True),'files':files,'after':after,'actions':pl.actions,'watched':{path:{k:v for k,v in rec.items() if k!='data' or path in files} for path,rec in pl.watched.items()},'inventory':pl.inventory,'owners':pl.owners,'tool_sha':sha(b)}
+        if shadow:s['rollback_netplan']=shadow['path']
         save_backup(d,s)
         status_write(d,'prepared')
     except BaseException:
@@ -1413,8 +1472,8 @@ if __name__=='__main__':
     try:main()
     except Exception as e:emit(**dict(getattr(e,'details',{}),status='STOP',reason=str(e)));sys.exit(1)
 MIST_PYTHON
-MIST_ENGINE_EXACT_D90EF494A441
-printf '%s  %s\n' 'd90ef494a441d8a4cad499d0f6d79bac73054a24382996719c8cfb62e24ac597' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
+MIST_ENGINE_EXACT_8EEE9405CE30
+printf '%s  %s\n' '8eee9405ce308c4c242cb54beff3b65d15f6469b5fcb15f095b7effd1ebedb0e' "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" | sha256sum --check --status || { printf '\033[1;31mSTOP: engine checksum mismatch\033[0m\n' >&2; exit 1; }
 chmod 700 "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 cat > "$mist_ipv6_ui_dir/display.py" <<'MIST_XSHELL_DISPLAY_EOF'
 #!/usr/bin/env python3
@@ -1442,7 +1501,7 @@ def main():
             say('  Сеть: ' + '; '.join(str(k) + ': ' + str(v) for k, v in value.items()), '36')
 
     if human:
-        say('\nMIST | IPv6 V2.3.3', '1;36')
+        say('\nMIST | IPv6 V2.3.4', '1;36')
         if os.environ.get('MIST_IPV6_VERIFIED_SHA'):
             say('[OK] Контрольная сумма исходника проверена', '32')
         if os.environ.get('MIST_IPV6_SAVED_SOURCE'):
@@ -1534,7 +1593,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         raise SystemExit(130)
 MIST_XSHELL_DISPLAY_EOF
-export MIST_IPV6_VERIFIED_SHA=d90ef494a441d8a4cad499d0f6d79bac73054a24382996719c8cfb62e24ac597
+export MIST_IPV6_VERIFIED_SHA=8eee9405ce308c4c242cb54beff3b65d15f6469b5fcb15f095b7effd1ebedb0e
 export MIST_IPV6_SAVED_SOURCE="$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh"
 [ "$#" -gt 0 ] || set -- --apply
 bash "$mist_ipv6_ui_dir/mist_ipv6_off_fixed.sh" "$@" | python3 "$mist_ipv6_ui_dir/display.py"

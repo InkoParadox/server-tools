@@ -23,7 +23,7 @@ def main():
             say('  Сеть: ' + '; '.join(str(k) + ': ' + str(v) for k, v in value.items()), '36')
 
     if human:
-        say('\nMIST | IPv6 V2.3.3', '1;36')
+        say('\nMIST | IPv6 V2.3.4', '1;36')
         if os.environ.get('MIST_IPV6_VERIFIED_SHA'):
             say('[OK] Контрольная сумма исходника проверена', '32')
         if os.environ.get('MIST_IPV6_SAVED_SOURCE'):
