@@ -40,11 +40,11 @@ def main(args=None):
     if not re.fullmatch(r'[0-9]+(?:\.[0-9]+)+',version):raise ValueError('invalid verified version')
     with (folder/'verified.json').open('x') as out:
         json.dump({'commit':commit,'version':version,'sha256':digest,'script':str(folder/'ipv6.sh')},out,sort_keys=True)
-    print('VERIFIED version='+version+' commit='+commit+' SHA256='+digest+' file='+str(folder/'ipv6.sh'),flush=True)
+    print('\033[1;92mVERIFIED\033[0m version='+version+' commit='+commit+' SHA256='+digest+' file='+str(folder/'ipv6.sh'),flush=True)
     return subprocess.run(['bash',str(folder/'ipv6.sh'),*args],check=False).returncode
 
 if __name__=='__main__':
     try:raise SystemExit(main())
     except Exception as error:
-        print('STOP: '+str(error)+'; no fallback executed',file=sys.stderr)
+        print('\033[0;31mSTOP\033[0m: '+str(error)+'; no fallback executed',file=sys.stderr,flush=True)
         raise SystemExit(1)

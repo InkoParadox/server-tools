@@ -22,6 +22,10 @@ class CommandTests(unittest.TestCase):
             for target,flags in ((field,[]),(terminal,['--bash'])):
                 subprocess.run([sys.executable,str(R/'tools/command.py'),'--ref',REF,'--output',str(target),*flags],check=True)
             self.assertEqual(field.read_bytes(),plain.encode()+b'\\r')
+            self.assertEqual(field.read_bytes()[-2:].hex(),'5c72')
+            self.assertFalse(field.read_bytes().endswith(bytes.fromhex('5c5c72')))
+            self.assertEqual(field.read_bytes().count(bytes([92])),1)
+            self.assertNotIn(bytes([13]),field.read_bytes());self.assertNotIn(bytes([10]),field.read_bytes())
             self.assertEqual(terminal.read_bytes(),plain.encode()+b'\n')
             self.assertLess(len(field.read_bytes()),1000)
 

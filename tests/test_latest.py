@@ -63,7 +63,8 @@ class LatestTests(unittest.TestCase):
         self.stack.enter_context(patch.object(latest.tempfile, 'mkdtemp', side_effect=make_folder))
         self.stack.enter_context(patch.object(latest.urllib.request, 'urlopen', side_effect=self.urlopen))
         self.stack.enter_context(patch.object(latest.subprocess, 'run', side_effect=execute))
-        self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        self.output = io.StringIO()
+        self.stack.enter_context(contextlib.redirect_stdout(self.output))
 
     def tearDown(self):
         self.stack.close()
@@ -105,6 +106,8 @@ class LatestTests(unittest.TestCase):
         self.assertEqual(receipt['version'], '2.3.4')
         self.assertEqual(receipt['sha256'], hashlib.sha256((folder / 'ipv6.sh').read_bytes()).hexdigest())
         self.assertEqual(self.executions, [['bash', str(folder / 'ipv6.sh')]])
+        self.assertTrue(self.output.getvalue().startswith('\x1b[1;92mVERIFIED\x1b[0m version=2.3.4 commit='+SHA1))
+        self.assertNotIn('\\033', self.output.getvalue())
         if os.name == 'posix':
             self.assertEqual(folder.stat().st_mode & 0o777, 0o700)
             for name in ('ipv6.sh', 'SHA256SUMS', 'verified.json'):
@@ -182,6 +185,14 @@ class LatestTests(unittest.TestCase):
         self.assertEqual(self.requests, [])
 
 class PermanentCommandTests(unittest.TestCase):
+    def test_real_entrypoint_stop_uses_red_ansi_and_nonzero(self):
+        result = subprocess.run([sys.executable, str(R / 'tools/latest.py'), '--unsupported'], capture_output=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, b'')
+        self.assertTrue(result.stderr.startswith(b'\x1b[0;31mSTOP\x1b[0m: '))
+        self.assertIn(b'no fallback executed', result.stderr)
+        self.assertNotIn(b'VERIFIED', result.stderr)
+
     def test_embedded_payload_is_exact_bootstrap_and_no_dollar(self):
         plain = command.latest_command()
         self.assertNotIn('$', plain)
@@ -197,6 +208,12 @@ class PermanentCommandTests(unittest.TestCase):
             target = pathlib.Path(folder) / 'Xshell.txt'
             subprocess.run([sys.executable, str(R / 'tools/command.py'), '--output', str(target)], check=True)
             self.assertEqual(target.read_bytes(), command.latest_command().encode() + b'\\r')
+            field = target.read_bytes()
+            self.assertEqual(field[-2:].hex(), '5c72')
+            self.assertFalse(field.endswith(bytes.fromhex('5c5c72')))
+            self.assertEqual(field.count(bytes([92])), 1)
+            self.assertNotIn(bytes([13]), field)
+            self.assertNotIn(bytes([10]), field)
             terminal = pathlib.Path(folder) / 'Bash.txt'
             subprocess.run([sys.executable, str(R / 'tools/command.py'), '--check', '--bash', '--output', str(terminal)], check=True)
             self.assertEqual(terminal.read_bytes(), command.latest_command(check=True).encode() + b'\n')
