@@ -21,7 +21,7 @@ class Pure(unittest.TestCase):
   n={'network':{'ethernets':{'x':{'addresses':[{'10.0.0.1/24':{'lifetime':0}},{'2001:db8::1/64':{}}]}}}}
   self.assertEqual(e.strip_netplan(n)['network']['ethernets']['x']['addresses'],[{'10.0.0.1/24':{'lifetime':0}}])
  def test_dns_dependency(self):
-  with self.assertRaises(e.Stop):e.strip_netplan({'network':{'ethernets':{'x':{'nameservers':{'addresses':['::1']}}}}})
+  self.assertEqual(e.strip_netplan({'network':{'ethernets':{'x':{'nameservers':{'addresses':['::1','1.1.1.1']}}}}})['network']['ethernets']['x']['nameservers']['addresses'],['1.1.1.1'])
  def test_tunnel4(self):self.assertEqual(e.strip_netplan({'network':{'tunnels':{'x':{'local':'1.2.3.4','remote':'2.3.4.5','mode':'gre'}}}})['network']['tunnels']['x']['remote'],'2.3.4.5')
  def test_tunnel6_dependency(self):
   with self.assertRaises(e.Stop):e.strip_netplan({'network':{'tunnels':{'x':{'remote':'2001:db8::1'}}}})
@@ -74,7 +74,7 @@ class Pure(unittest.TestCase):
   src='UUID=x\nIPADDR=10.0.0.1\nMTU=1420\nDNS1=1.1.1.1\nIPV6ADDR=2001:db8::1/64\nIPV6INIT=yes\n'
   v=e.strip_ifcfg(src);self.assertIn('IPADDR=10.0.0.1\nMTU=1420\nDNS1=1.1.1.1\n',v);self.assertIn('IPV6_DISABLED=yes',v);self.assertEqual(e.strip_ifcfg(v),v)
  def test_ifcfg_dns6_refused(self):
-  with self.assertRaises(e.Stop):e.strip_ifcfg('DNS2="2001:db8::53"\n')
+  self.assertNotIn('DNS2=',e.strip_ifcfg('DNS1=1.1.1.1\nDNS2="2001:db8::53"\n'))
  def test_explicit_sysctl_and_symlink(self):
   old=e.ROOT
   try:

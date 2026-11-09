@@ -3,7 +3,7 @@
 import argparse,base64,copy,ctypes,errno,fcntl,socket,struct,collections,glob,hashlib,ipaddress,json,os,pathlib,re,shlex,shutil,signal,stat,subprocess,sys,tempfile,time,uuid
 need_python = sys.version_info >= (3,8)
 if not need_python:raise SystemExit('STOP: Python >=3.8 required; no package installed')
-VERSION='2.3.4'
+VERSION='2.4.0'
 APPLY_DEADLINE=None
 ROOT=pathlib.Path('/')
 STATE='/var/lib/mist-ipv6'
@@ -226,6 +226,20 @@ def is6(s):
     try:return ipaddress.ip_interface(s).version==6
     except ValueError:return ':' in s
 
+def dns_is6(value):
+    host=str(value).split('#',1)[0]
+    if host.startswith('['):host=host[1:].split(']',1)[0]
+    else:
+        try:return ipaddress.ip_address(host.split('%',1)[0]).version==6
+        except ValueError:
+            if ':' in host:
+                address,port=host.rsplit(':',1)
+                try:
+                    if ipaddress.ip_address(address).version==4 and port.isdecimal():return False
+                except ValueError:pass
+    try:return ipaddress.ip_address(host.split('%',1)[0]).version==6
+    except ValueError:raise Stop('unsupported DNS endpoint: '+str(value))
+
 def strip_netplan(doc):
     d=copy.deepcopy(doc);n=d.get('network',{})
     for group,defs in n.items():
@@ -234,7 +248,7 @@ def strip_netplan(doc):
             need(isinstance(e,dict),'invalid Netplan definition '+str(name))
             nm=e.get('networkmanager',{});pas=nm.get('passthrough',{})
             if pas or group=='nm-devices' or e.get('renderer',n.get('renderer'))=='NetworkManager':
-                need(not any(k.startswith('ipv6.dns') and v for k,v in pas.items()),'IPv6 DNS in NM passthrough '+str(name))
+                need(not any(k.startswith(('ipv6.dns-search','ipv6.dns-priority')) and v for k,v in pas.items()),'IPv6 DNS selection policy in NM passthrough '+str(name))
                 need(not any(k.endswith('.endpoint') and str(v).startswith('[') for k,v in pas.items()),'IPv6 VPN endpoint in NM passthrough '+str(name))
                 e.setdefault('networkmanager',{})['passthrough']={**{k:v for k,v in pas.items() if not k.startswith('ipv6.')},'ipv6.method':'disabled'}
             if group=='nm-devices':continue
@@ -242,7 +256,7 @@ def strip_netplan(doc):
             if 'addresses' in e:e['addresses']=[a for a in e['addresses'] if not is6(next(iter(a)) if isinstance(a,dict) else a)]
             if 'routes' in e:e['routes']=[r for r in e['routes'] if not is6(r.get('via','')) and not is6(r.get('to','')) and r.get('family') not in (6,'ipv6')]
             if 'routing-policy' in e:e['routing-policy']=[r for r in e['routing-policy'] if not any(is6(r.get(k,'')) for k in ('from','to'))]
-            need(not any(is6(x) for x in e.get('nameservers',{}).get('addresses',[])),'IPv6 DNS in Netplan '+str(name)+'; DNS must be preserved')
+            if 'addresses' in e.get('nameservers',{}):e['nameservers']['addresses']=[x for x in e['nameservers']['addresses'] if not dns_is6(x)]
             for k in ('gateway6','ipv6-address-generation','ipv6-address-token','ipv6-privacy','ipv6-mtu'):e.pop(k,None)
             e['dhcp6']=False;e['accept-ra']=False;e['link-local']=[x for x in e.get('link-local',[]) if x=='ipv4']
     return d
@@ -283,7 +297,13 @@ def strip_networkd(text):
             if section=='RoutingPolicyRule' and k=='Family' and v=='both':v='ipv4'
             if section=='Network':
                 if k in ('IPv6SendRA','DHCPPrefixDelegation') and v.lower() in ('yes','true','1','on','y','t'):raise Stop('IPv6 router/prefix delegation is a real dependency')
-                if k in ('DNS','NTP') and any(is6(x) for x in v.split()):raise Stop('IPv6 '+k+' dependency in networkd')
+                if k=='NTP' and any(is6(x) for x in v.split()):raise Stop('IPv6 NTP dependency in networkd')
+                if k=='DNS':
+                    values=[x for x in v.split() if not dns_is6(x)]
+                    # An empty assignment resets earlier IPv4 DNS. Omit an
+                    # IPv6-only line, preserving an intentional original reset.
+                    if v and not values:continue
+                    v=' '.join(values)
                 if k in ('Address','Gateway') and is6(v):continue
                 if k in ('DHCP','LinkLocalAddressing'):v=networkd_ipv4(k,v)
                 elif k in ('IPv6AcceptRA','IPv6LinkLocalAddressGenerationMode','IPv6PrivacyExtensions','IPv6Token','IPv6MTUBytes'):continue
@@ -319,7 +339,10 @@ def strip_interfaces(text,inet4_names=None,ifup2=False,disable_attr=False,inline
             m=re.match(r'(\s*)(address|gateway|dns-nameservers|netmask)\s+(.*)',line)
             if m:
                 ws,k,v=m.groups();values=v.split()
-                if k=='dns-nameservers':need(not any(is6(x) for x in values),'IPv6 DNS in interfaces; DNS must be preserved')
+                if k=='dns-nameservers':
+                    values=[x for x in values if not dns_is6(x)]
+                    if values:kept.append(ws+k+' '+' '.join(values)+'\n')
+                    continue
                 if ipv6 and k in ('address','gateway','netmask'):continue
                 if k in ('address','gateway') and any(is6(x) for x in values):
                     values=[x for x in values if not is6(x)]
@@ -351,7 +374,8 @@ def strip_nm_keyfile(text):
         if sec=='ipv6':
             need(not found,'duplicate ipv6 keyfile group');found=True
             kv=ini_pairs(lines)
-            need(not any(is6(v) for line in kv.get('dns',[]) for v in line.split(';') if v),'IPv6 DNS in NetworkManager keyfile')
+            need(not any(v for k in ('dns-search','dns-priority','dns-options') for v in kv.get(k,[])),
+                 'IPv6-specific DNS selection policy in NetworkManager keyfile requires its owner')
             out.append('[ipv6]\nmethod=disabled\n')
         else:out.extend(lines)
     # A standalone profile without an explicit IPv6 group defaults to auto.
@@ -371,7 +395,10 @@ def strip_ifcfg(text):
             out.append(line);continue
         key,value=m.groups()
         if re.fullmatch(r'DNS[0-9]+',key):
-            vals=shlex.split(value,comments=True);need(not any(is6(v) for v in vals),'IPv6 DNS in ifcfg')
+            vals=shlex.split(value,comments=True)
+            if any(dns_is6(v) for v in vals):
+                need(len(vals)==1,'ambiguous DNS assignment in ifcfg: '+key)
+                continue
         if key=='IPV6FORWARDING':need(not any(v.lower() in ('yes','true','1') for v in shlex.split(value,comments=True)),'ifcfg IPv6 forwarding dependency')
         if key.startswith(('IPV6','DHCPV6')):continue
         out.append(line)
@@ -416,7 +443,7 @@ def cloud_netplan_renderings(net):
     return sorted(sha(data) for data in cloud_netplan_outputs(net)[1])
 
 class Plan:
-    def __init__(self):self.changes={};self.watched={};self.actions=[];self.owners={};self.nm_devices={};self.nm_paths={};self.netplan_before=None;self.nm_catalog={};self.cloud_cache=None;self.rollback_netplan=None
+    def __init__(self):self.changes={};self.watched={};self.actions=[];self.owners={};self.nm_devices={};self.nm_paths={};self.netplan_before=None;self.nm_catalog={};self.cloud_cache=None;self.rollback_netplan=None;self.dns_sources={};self.dns_generated={};self.runtime_resolver=None
     def watch(self,path):
         if path not in self.watched:self.watched[path]=file_record(path)
         return self.watched[path]
@@ -427,6 +454,7 @@ class Plan:
         self.changes[path]={'data':base64.b64encode(data).decode(),'sha':sha(data),'mode':desired_mode,'uid':rec.get('uid',0),'gid':rec.get('gid',0),'mtime':time.time_ns(),'atime':time.time_ns()}
     def watch_globs(self):
         patterns=('/etc/netplan/*.yaml','/run/netplan/*.yaml','/lib/netplan/*.yaml','/etc/systemd/network/*.network','/run/systemd/network/*.network','/usr/lib/systemd/network/*.network','/etc/systemd/network/*.network.d/*.conf','/run/systemd/network/*.network.d/*.conf','/usr/lib/systemd/network/*.network.d/*.conf','/etc/NetworkManager/system-connections/*','/run/NetworkManager/system-connections/*','/etc/NetworkManager/NetworkManager.conf','/etc/NetworkManager/conf.d/*.conf','/usr/lib/NetworkManager/conf.d/*.conf','/run/NetworkManager/conf.d/*.conf','/etc/systemd/networkd.conf','/etc/systemd/networkd.conf.d/*.conf','/etc/network/if-up.d/*','/etc/network/ifupdown2/*.conf','/etc/network/interfaces','/etc/network/interfaces.d/*','/etc/cloud/cloud.cfg','/etc/cloud/cloud-init.disabled','/etc/cloud/cloud.cfg.d/*.cfg','/etc/sysctl.conf','/etc/sysctl.d/*.conf','/usr/lib/NetworkManager/system-connections/*','/etc/sysconfig/network-scripts/ifcfg-*','/etc/sysconfig/network-scripts/route6-*','/etc/sysconfig/network-scripts/rule6-*','/etc/sysconfig/network','/run/sysctl.d/*.conf','/usr/lib/sysctl.d/*.conf')
+        patterns+=tuple(folder+suffix for folder in ('/etc/systemd','/run/systemd','/usr/local/lib/systemd','/usr/lib/systemd') for suffix in ('/resolved.conf','/resolved.conf.d/*.conf'))
         paths=sorted({str(q.relative_to(ROOT)).replace(os.sep,'/') for pat in patterns for q in ROOT.glob(pat.lstrip('/')) if q.is_file() and not q.is_symlink()})
         paths=sorted(set(paths)|{x.lstrip('/') for x in self.watched if p(x).is_file()})
         return ['/'+x for x in paths if not (self.netplan_before is not None and (x.startswith('run/systemd/network/10-netplan-') or x.startswith('run/NetworkManager/system-connections/netplan-') or x=='run/NetworkManager/conf.d/10-globally-managed-devices.conf'))]
@@ -788,12 +816,251 @@ def resolver_normalized(r):
     r=copy.deepcopy(r)
     for k in ('resolved_dns','resolved_domains'):
         if k in r:r[k]=resolved_map(r[k])
+    link=r.get('link')
+    if link and os.path.normpath(os.path.join('/etc',link)) in ('/run/systemd/resolve/resolv.conf','/var/run/systemd/resolve/resolv.conf'):
+        # resolved adds/removes comments (e.g. the >3 servers warning). Keep
+        # every semantic directive and its order; never normalize unmanaged data.
+        data=base64.b64decode(r['data']).decode()
+        r['data']=base64.b64encode('\n'.join(' '.join(line.split()) for line in data.splitlines()
+            if line.strip() and not line.lstrip().startswith(('#',';'))).encode()).decode()
     return r
+
+def resolver_after(before):
+    result=copy.deepcopy(before['resolver'])
+    if before.get('dns_delta'):
+        result['resolved_dns']={scope:[v for v in values if not dns_is6(v)] for scope,values in resolved_map(result['resolved_dns']).items()}
+        if result.get('link') and p('/etc/resolv.conf').resolve()==p('/run/systemd/resolve/resolv.conf').resolve():
+            text=base64.b64decode(result['data']).decode()
+            result['data']=base64.b64encode(''.join(line for line in text.splitlines(keepends=True)
+                if not (len(line.split())>1 and line.split()[0]=='nameserver' and dns_is6(line.split()[1]))).encode()).decode()
+    return result
+
+def getent4_ok(name):
+    try:return run(['getent','ahostsv4',name],False,timeout=12).returncode==0
+    except subprocess.TimeoutExpired:return False
+
+def dns4_probe(server,name='example.com',positive=True,qtype=1,iface=None):
+    # Query the retained upstream over IPv4 before writes; an AAAA RR is not
+    # evidence of IPv6 transport. Do not silently substitute another resolver.
+    host=server.split('#',1)[0];port=53
+    if ':' in host:host,number=host.rsplit(':',1);port=int(number)
+    need(ipaddress.ip_address(host).version==4,'unsupported IPv4 DNS endpoint '+server)
+    ident=os.urandom(2);labels=name.rstrip('.').split('.')
+    question=b''.join(bytes([len(x)])+x.encode('idna') for x in labels)+b'\0'+struct.pack('!HH',qtype,1)
+    packet=ident+b'\x01\x00\x00\x01'+b'\0'*6+question
+    with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
+        if iface:sock.setsockopt(socket.SOL_SOCKET,socket.SO_BINDTODEVICE,iface.encode()+b'\0')
+        sock.settimeout(4);sock.connect((host,port));sock.send(packet);answer=sock.recv(65535)
+    need(len(answer)>=12 and answer[:2]==ident and answer[2]&128 and not answer[2]&2 and
+         (answer[3]&15==0 and int.from_bytes(answer[6:8],'big')>0 if positive else answer[3]&15==3),
+         'IPv4 DNS query failed: '+server+' zone '+name)
+
+def restore_resolver(before,after=False):
+    target=resolver_after(before) if after else before['resolver']
+    if 'resolved_dns' not in target:return
+    fields=(('resolved_dns','dns'),('resolved_domains','domain'),('resolved_default_route','default-route'),
+            ('resolved_dnssec','dnssec'),('resolved_dnsovertls','dnsovertls'),('resolved_llmnr','llmnr'),('resolved_mdns','mdns'))
+    native={scope for scope,owner in before.get('owners',{}).items() if owner in ('networkd','netplan/networkd')}
+    for scope in native:
+        deadline=time.monotonic()+25
+        while True:
+            mismatch=[]
+            for field,command in fields:
+                if scope not in target.get(field,{}):continue
+                current=resolved_map(run(['resolvectl',command,scope]).stdout).get(scope)
+                if current!=target[field][scope]:mismatch.append(command)
+            if not mismatch:break
+            need(time.monotonic()<deadline,'native networkd DNS/selection did not converge on '+scope+': '+','.join(mismatch)+'; refusing a runtime override of DHCP/RA policy')
+            time.sleep(0.5)
+    for scope,values in resolved_map(target['resolved_dns']).items():
+        if scope=='global' or scope in native:continue
+        current=resolved_map(run(['resolvectl','dns',scope]).stdout).get(scope)
+        if current!=values:run(['resolvectl','dns',scope,*(values or [''])])
+    for field,command in (('resolved_domains','domain'),('resolved_default_route','default-route'),
+                          ('resolved_dnssec','dnssec'),('resolved_dnsovertls','dnsovertls'),
+                          ('resolved_llmnr','llmnr'),('resolved_mdns','mdns')):
+        for scope,values in target.get(field,{}).items():
+            if scope!='global' and scope not in native:
+                current=resolved_map(run(['resolvectl',command,scope]).stdout).get(scope)
+                if current!=values:run(['resolvectl',command,scope,*(values or [''])])
+
+def dns_source_values(text):
+    values=[];domains=[]
+    for section,lines in unit_sections(text):
+        pairs=ini_pairs(lines)
+        if section=='Network':
+            for key,target in (('DNS',values),('Domains',domains)):
+                for value in pairs.get(key,[]):
+                    if not value:target.clear()
+                    else:target.extend(value.split())
+        elif section in ('ipv4','ipv6'):
+            for value in pairs.get('dns',[]):values.extend(x for x in value.split(';') if x)
+            for value in pairs.get('dns-search',[]):domains.extend(x for x in value.split(';') if x)
+    for line in text.splitlines() if not any(section in ('Network','ipv4','ipv6') for section,_ in unit_sections(text)) else []:
+        match=re.match(r'\s*(DNS[0-9]+|DNS|DOMAINS|dns-nameservers|dns-search)\s*(?:=|\s)\s*(.*)',line)
+        if match:
+            key,value=match.groups();target=domains if key in ('DOMAINS','dns-search') else values
+            target.extend(shlex.split(value,comments=True))
+    return values,domains
+
+def interface_dns_source(pl,scope):
+    out=[]
+    for path,record in pl.watched.items():
+        if not path.startswith('/etc/network/') or not record['exists']:continue
+        current=None
+        for line in base64.b64decode(record['data']).decode().splitlines():
+            match=re.match(r'\s*iface\s+(\S+)\s+',line)
+            if match:current=match[1]
+            elif re.match(r'\s*(?:source|source-directory|mapping|rename|auto|allow-\S+)\s',line):current=None
+            if current==scope and re.match(r'\s*dns-(?:nameservers|search)\s+',line):out.append(line+'\n')
+    return ''.join(out)
+
+def plan_dns(pl,before):
+    resolver_before=before['resolver'];scopes=resolved_map(resolver_before.get('resolved_dns',{}))
+    if 'resolved_dns' not in resolver_before:return
+    changed={scope:values for scope,values in scopes.items() if any(dns_is6(v) for v in values)}
+    # DHCP6/RA may supply domains even when its DNS list contains only IPv4.
+    # Validate all populated link scopes so runtime restoration cannot hide a
+    # durable domain loss that would surface only on the next boot.
+    checking={scope:values for scope,values in scopes.items() if scope in changed or scope!='global' and
+              (values or resolver_before.get('resolved_domains',{}).get(scope))}
+    # Global resolved DNS is read from the actual merged persistent source,
+    # not from /etc/resolv.conf (which remains owned by its manager).
+    global_sources={};effective={};global_dns=[];fallback=[]
+    main=next((path for path in ('/etc/systemd/resolved.conf','/run/systemd/resolved.conf','/usr/local/lib/systemd/resolved.conf','/usr/lib/systemd/resolved.conf') if p(path).exists()),'/etc/systemd/resolved.conf')
+    if p(main).exists():global_sources[main]=main
+    drops={}
+    for folder in ('/usr/lib/systemd/resolved.conf.d','/usr/local/lib/systemd/resolved.conf.d','/run/systemd/resolved.conf.d','/etc/systemd/resolved.conf.d'):
+        for q in p(folder).glob('*.conf'):
+            need(not q.is_symlink(),'resolved source symlink requires its owner: '+str(q))
+            drops[q.name]='/'+q.relative_to(ROOT).as_posix()
+    paths=list(global_sources)+[path for _,path in sorted(drops.items())]
+    restart=False
+    for path in paths:
+        record=pl.watch(path);text=base64.b64decode(record['data']).decode();out=[];modified=False
+        for section,lines in unit_sections(text):
+            for line in lines:
+                match=re.match(r'(\s*)(DNS|FallbackDNS)\s*=\s*(.*?)\s*$',line) if section=='Resolve' else None
+                if match:
+                    ws,key,value=match.groups();tokens=shlex.split(value);target=global_dns if key=='DNS' else fallback
+                    if not tokens:target.clear()
+                    else:target.extend(tokens)
+                    kept=[v for v in tokens if not dns_is6(v)]
+                    if kept!=tokens:
+                        need(not path.startswith('/run/'),'unknown runtime resolved writer: '+path+' DNS '+value)
+                        # A filtered IPv6-only assignment must not reset prior IPv4 entries.
+                        line=ws+key+'='+' '.join(kept)+'\n' if kept else '';modified=True
+                out.append(line)
+        if modified:
+            destination=path if path.startswith('/etc/') else ('/etc/systemd/resolved.conf' if path==main else '/etc/systemd/resolved.conf.d/'+pathlib.Path(path).name)
+            pl.put(destination,''.join(out).encode());restart=True
+    if 'global' in changed:
+        need(scopes['global']==global_dns,'global resolved runtime DNS has unknown owner: '+str(scopes['global']))
+    for scope,values in checking.items():
+        kept=[v for v in values if not dns_is6(v)];source='resolved.conf' if scope=='global' else pl.dns_sources.get(scope,'unknown')
+        reason='DNS scope '+scope+' source '+source+' IPv6 '+','.join(v for v in values if dns_is6(v))
+        need(kept or scope not in changed,reason+' has no IPv4 DNS; split DNS cannot be moved to another scope')
+        need(resolver_before.get('resolved_dnsovertls',{}).get(scope,['no'])==['no'],reason+' uses DNS-over-TLS; direct IPv4 validation unsupported')
+        if scope!='global':
+            need(scope in pl.owners and not pl.owners[scope].startswith('unmanaged') and source!='unknown',reason+' has no supported persistent owner')
+            source_paths=[source]
+            if source.endswith('.network'):
+                drops={}
+                for folder in ('/usr/lib/systemd/network','/run/systemd/network','/etc/systemd/network'):
+                    for q in p(folder+'/'+pathlib.Path(source).name+'.d').glob('*.conf'):drops[q.name]='/'+q.relative_to(ROOT).as_posix()
+                source_paths.extend(v for _,v in sorted(drops.items()))
+            source_text=[]
+            for path in source_paths:
+                if path.startswith('/run/systemd/network/10-netplan-'):
+                    # The persistent Netplan inputs are watched. Its generated
+                    # output is expected to change during apply and rollback.
+                    rec=file_record(path);pl.dns_generated[path]=rec
+                else:rec=pl.watch(path)
+                source_text.append(base64.b64decode(rec['data']).decode()+'\n')
+            static,domains=dns_source_values(''.join(source_text))
+            if pl.owners[scope]=='ifupdown':static,domains=dns_source_values(interface_dns_source(pl,scope))
+            lease_values=[];lease_domains=[]
+            index=next(x['ifindex'] for x in before['links'] if x['ifname']==scope)
+            lease6=[]
+            if pl.owners[scope] in ('networkd','netplan/networkd'):
+                result=run(['networkctl','--json=short','status',scope],False)
+                try:details=json.loads(result.stdout) if result.returncode==0 else None
+                except ValueError:details=None
+                if details is not None:
+                    need(details.get('Name')==scope and details.get('Index')==index and details.get('NetworkFile')==source,
+                         reason+' networkd ownership changed during discovery')
+                    lease_values=[];lease_domains=[]
+                    for row in details.get('DNS',[]):
+                        origin=row.get('ConfigSource')
+                        need(origin in ('static','DHCPv4','DHCPv6','NDisc'),reason+' has unsupported networkd DNS writer '+str(origin))
+                        if origin=='static':continue
+                        address=ipaddress.ip_address(bytes(row['Address']))
+                        need(row.get('Port',0) in (0,53) and not row.get('ServerName') and row.get('InterfaceIndex',index) in (0,index),
+                             reason+' has unsupported dynamic DNS endpoint metadata '+str(address))
+                        if origin=='DHCPv4':lease_values.append(str(address))
+                        elif address.version==6:lease6.append(str(address))
+                    for key,prefix in (('SearchDomains',''),('RouteDomains','~')):
+                        for row in details.get(key,[]):
+                            need(row.get('ConfigSource') in ('static','DHCPv4','DHCPv6','NDisc'),
+                                 reason+' has unsupported networkd domain writer '+str(row.get('ConfigSource'))+' domain '+str(row.get('Domain')))
+                            if row.get('ConfigSource')=='DHCPv4':lease_domains.append(prefix+row['Domain'])
+            if pl.owners[scope] in ('NetworkManager','netplan/NetworkManager'):
+                for family in ('DHCP4.OPTION','DHCP6.OPTION'):
+                    options=run(['nmcli','-g',family,'device','show',scope]).stdout
+                    for line in options.splitlines():
+                        if '=' not in line:continue
+                        key,value=(v.strip() for v in line.split('=',1))
+                        if key in ('domain_name_servers','dhcp6_name_servers'):
+                            (lease_values if family=='DHCP4.OPTION' else lease6).extend(value.split())
+                        if family=='DHCP4.OPTION' and key in ('domain_name','domain_search'):lease_domains.extend(value.split())
+            need(all(v in static+lease_values+lease6 for v in values),reason+' includes DNS not attributable to configuration or DHCP lease')
+            wanted_domains=resolver_before.get('resolved_domains',{}).get(scope,[])
+            need(all(v in domains+lease_domains for v in wanted_domains),reason+' has domains from an unknown/DHCPv6/RA source; cannot preserve selection durably')
+        probes=[]
+        for domain in resolver_before.get('resolved_domains',{}).get(scope,[]):
+            name=domain.lstrip('~').rstrip('.')
+            if name and not name.endswith('arpa'):probes.append(name)
+        # A corporate-only scope need not provide public recursion. Validate
+        # its routed zones; default-route scopes must resolve the public canary.
+        public=scope=='global' or resolver_before.get('resolved_default_route',{}).get(scope,['yes'])==['yes'] or not probes
+        zone_checks=[]
+        for zone in probes:
+            try:result=run(['resolvectl','query','--type=SOA','--legend=no',zone],False,timeout=12)
+            except subprocess.TimeoutExpired as error:raise Stop(reason+' system resolver timed out validating routed zone '+zone) from error
+            # NXDOMAIN is a useful negative baseline only when the system
+            # resolver explicitly proves absence; timeout/refusal is not proof.
+            missing=result.returncode!=0 and 'not found' in result.stderr.lower()
+            need(result.returncode==0 or missing,reason+' cannot validate routed zone '+zone+' through the system resolver')
+            zone_checks.append((zone,not missing))
+        for server in kept:
+            try:
+                if public:dns4_probe(server,iface=None if scope=='global' else scope)
+                for zone,positive in zone_checks:dns4_probe(server,zone,positive=positive,qtype=6,iface=None if scope=='global' else scope)
+            except (OSError,ValueError) as error:raise Stop(reason+' retained IPv4 DNS '+server+' unreachable: '+str(error)) from error
+        if public and kept:before['dns_probe_required']=True
+    if any(dns_is6(v) for v in fallback):
+        need(any(not dns_is6(v) for v in fallback),'resolved FallbackDNS has no IPv4 address: '+','.join(fallback))
+    if changed:before['dns_delta']=True
+    before['dns_probes']=['example.com']
+    before['dns_zone_probes']=[]
+    for scope in checking:
+        for domain in resolver_before.get('resolved_domains',{}).get(scope,[]):
+            name=domain.lstrip('~').rstrip('.')
+            if name and not name.endswith('arpa'):
+                result=run(['resolvectl','query','--type=SOA','--legend=no',name],False,timeout=12)
+                if result.returncode==0:before['dns_zone_probes'].append(name)
+                if getent4_ok(name):before['dns_probes'].append(name)
+    if restart:pl.actions.append({'type':'resolved-restart'})
 def resolver():
     q=p('/etc/resolv.conf');out={'link':os.readlink(q) if q.is_symlink() else None,'data':base64.b64encode(q.read_bytes()).decode()}
     if active('systemd-resolved'):
         out['resolved_dns']=resolved_map(run(['resolvectl','dns']).stdout.strip())
         out['resolved_domains']=resolved_map(run(['resolvectl','domain']).stdout.strip())
+        for command in ('dnssec','dnsovertls','llmnr','mdns'):
+            out['resolved_'+command]=resolved_map(run(['resolvectl',command]).stdout.strip())
+        out['resolved_default_route']={}
+        for name in out['resolved_dns']:
+            if name!='global':out['resolved_default_route'].update(resolved_map(run(['resolvectl','default-route',name]).stdout.strip()))
     return out
 def runtime():
     return {'knobs':knobs(),'addr4':jr('ip','-j','-4','address','show'),'routes4':jr('ip','-j','-4','route','show','table','all'),
@@ -811,7 +1078,7 @@ def verify4(before,now):
     need(route_set(before['routes4'])==route_set(now['routes4']),'IPv4 route changed or disappeared')
     need(before['rules4']==now['rules4'],'IPv4 policy rules changed')
     need(link_set(before['links'],before.get('owners'))==link_set(now['links'],before.get('owners')),'interface topology or MTU changed')
-    need(resolver_normalized(before['resolver'])==resolver_normalized(now['resolver']),'DNS configuration or resolv.conf link changed')
+    need(resolver_normalized(resolver_after(before))==resolver_normalized(now['resolver']),'DNS configuration or resolv.conf link changed')
     need(before['promote']==now['promote'],'IPv4 promote_secondaries changed')
 def wait4(before,seconds=30):
     deadline=time.monotonic()+seconds;error=None
@@ -828,7 +1095,9 @@ def verify_off(before):
     now=wait4(before)
     need(all(v.get('disable_ipv6')==1 for v in now['knobs'].values()),'manager re-enabled IPv6')
     need(not addr_set(now['addr6'],'inet6') and not now['routes6'],'IPv6 address/route remains')
-    if before.get('dns_probe_ok',True):run(['getent','ahostsv4','example.com'],timeout=12)
+    if before.get('dns_probe_ok',True) or before.get('dns_probe_required'):
+        for name in before.get('dns_probes',['example.com']):run(['getent','ahostsv4',name],timeout=12)
+    for zone in before.get('dns_zone_probes',[]):run(['resolvectl','query','--type=SOA','--legend=no',zone],timeout=12)
     if before.get('chrony_ipv4_monitor'):chrony_ipv4_sources()
     return now
 def transaction_error(code, message, **details):
@@ -938,15 +1207,16 @@ def dependencies(before):
     text=base64.b64decode(before['resolver']['data']).decode()
     for l in text.splitlines():
         f=l.split()
-        if len(f)>1 and f[0]=='nameserver':need(not is6(f[1]),'IPv6 resolver endpoint in resolv.conf')
-    for values in resolved_map(before['resolver'].get('resolved_dns',{})).values():
-        need(not any(is6(v) for v in values),'IPv6 upstream DNS in systemd-resolved')
+        if len(f)>1 and f[0]=='nameserver':need(not dns_is6(f[1]) or
+            'resolved_dns' in before['resolver'] and p('/etc/resolv.conf').is_symlink() and p('/etc/resolv.conf').resolve()==p('/run/systemd/resolve/resolv.conf').resolve(),
+            'IPv6 resolver endpoint in resolv.conf: '+f[1]+' source /etc/resolv.conf')
+    # Resolved upstreams are checked against their persistent owner by plan_dns.
 
 def discover():
     for c in ('ip','ss','systemctl','getent'):need(shutil.which(c),'missing command: '+c)
     need(p('/run/systemd/system').is_dir(),'systemd is required for an SSH-independent and reboot-surviving rollback')
     need(os.stat('/proc/self/ns/net').st_ino==os.stat('/proc/1/ns/net').st_ino,'run in the host PID 1 network namespace; independent rollback uses that namespace')
-    before=runtime();before['dns_probe_ok']=run(['getent','ahostsv4','example.com'],False,timeout=12).returncode==0;before['captured_at']=time.time();dependencies(before);pl=Plan();netplan=False;nm=False;eni=False
+    before=runtime();before['dns_probe_ok']=getent4_ok('example.com');before['captured_at']=time.time();dependencies(before);pl=Plan();netplan=False;nm=False;eni=False
     eni_result=run(['ifquery','--list'],False) if shutil.which('ifquery') else None
     eni_names=set(eni_result.stdout.split()) if eni_result and not eni_result.returncode else set()
     if eni_result and eni_result.returncode and p('/etc/network/interfaces').exists():
@@ -973,15 +1243,17 @@ def discover():
         if nm_uuid and pl.nm_catalog.get(nm_uuid,{}).get('flags',0)&8:nm_uuid=''
         if (nf and nm_uuid) or (eni_active and name in eni_names and (nf or nm_uuid)):raise Stop('multiple enabled configuration owners claim '+name+'; resolve competing networkd/NM/ifupdown writers before IPv6 changes')
         if nf:
+            pl.dns_sources[name]=nf
             if pathlib.Path(nf).name.startswith('10-netplan-'):netplan=True;pl.owners[name]='netplan/networkd'
             else:pl.networkd(nf,name);pl.owners[name]='networkd'
         elif nm_uuid:
             profile=pl.nm_catalog.get(nm_uuid);need(profile,'active NM UUID absent from settings catalog')
+            pl.dns_sources[name]=profile['path']
             filename=pathlib.Path(profile['path']).name
             need(profile['path'],'active NM profile is unsaved; no durable owner for '+name)
             if filename.startswith('netplan-'):netplan=True;pl.owners[name]='netplan/NetworkManager';pl.nm_devices[name]=nm_uuid
             else:nm=True;pl.owners[name]='NetworkManager'
-        elif name in eni_names:eni=True;pl.owners[name]='ifupdown'
+        elif name in eni_names:eni=True;pl.owners[name]='ifupdown';pl.dns_sources[name]='/etc/network/interfaces'
         else:
             need(name not in primary,'no persistent settings owner for SSH/default-route interface '+name)
             pl.owners[name]='unmanaged host link (kernel policy only)'
@@ -991,6 +1263,7 @@ def discover():
         if unit.name not in processed and not unit.name.startswith('10-netplan-'):pl.networkd('/'+str(unit.relative_to(ROOT)),None)
     if nm or pl.nm_catalog:pl.nm()
     if eni or (eni_result and not eni_result.returncode and eni_names-{'lo'}):pl.interfaces()
+    plan_dns(pl,before)
     pl.cloud()
     pl.policy()
     pl.inventory=pl.watch_globs()
@@ -1006,6 +1279,7 @@ def discover():
         selected.append(a)
     pl.actions=selected
     before['owners']=pl.owners
+    pl.runtime_resolver=before['resolver']
     return pl,before
 
 def apply_actions(actions):
@@ -1031,6 +1305,7 @@ def apply_actions(actions):
                 if ident in a.get('uuids',[]) and name and name!='--':run(['nmcli','device','reapply',name],timeout=35)
         # ifupdown config changes are IPv6-only; sysctl applies them without cycling IPv4/DHCP.
         elif t=='ifupdown':run(['ifquery','--list'])
+        elif t=='resolved-restart':run(['systemctl','restart','systemd-resolved'])
     # networkd reload reconfigures interfaces affected by changed .network files.
     if networkd_reload:run(['networkctl','reload'])
 
@@ -1052,6 +1327,11 @@ def validate_plan(pl):
             for path,r in pl.watched.items():
                 if '/netplan/' in path and path.endswith('.yaml') and r['exists']:
                     q=root/path.lstrip('/');q.parent.mkdir(parents=True,exist_ok=True);q.write_bytes(base64.b64decode(r['data']));q.chmod(0o600)
+            if pl.dns_generated:
+                run(['netplan','generate','--root-dir',tmp],timeout=30)
+                for path,record in pl.dns_generated.items():
+                    need((root/path.lstrip('/')).is_file() and sha((root/path.lstrip('/')).read_bytes())==record['sha'],
+                         'generated DNS source differs from persistent Netplan inputs: '+path)
             for path,r in pl.changes.items():
                 if '/netplan/' in path:
                     q=root/path.lstrip('/');q.parent.mkdir(parents=True,exist_ok=True);q.write_bytes(base64.b64decode(r['data']));q.chmod(0o600)
@@ -1082,11 +1362,11 @@ def load(d,expected_value=None):
     for name in BACKUP_COPIES:
         try:
             b=(d/(name+'.json')).read_bytes();expected=(d/(name+'.sha256')).read_text().strip();need(sha(b)==expected,'backup digest mismatch')
-            s=json.loads(b);need(s['version'] in ('2.1','2.2','2.3','2.3.1','2.3.2','2.3.3',VERSION),'backup version mismatch')
+            s=json.loads(b);need(s['version'] in ('2.1','2.2','2.3','2.3.1','2.3.2','2.3.3','2.3.4',VERSION),'backup version mismatch')
             need(s['machine']==p('/etc/machine-id').read_text().strip(),'backup belongs to a different machine')
             need(sha((d/'tool.sh').read_bytes())==s['tool_sha'],'backup tool digest mismatch')
             for path,r in s['files'].items():
-                need((path=='/etc/sysctl.conf' or path.startswith(('/etc/netplan/','/etc/systemd/network/','/etc/NetworkManager/system-connections/','/etc/network/','/etc/cloud/','/etc/sysctl.d/','/etc/sysconfig/network-scripts/'))) and '..' not in pathlib.Path(path).parts,'unsafe restore target')
+                need((path in ('/etc/sysctl.conf','/etc/systemd/resolved.conf') or path.startswith(('/etc/netplan/','/etc/systemd/network/','/etc/NetworkManager/system-connections/','/etc/network/','/etc/cloud/','/etc/sysctl.d/','/etc/sysconfig/network-scripts/','/etc/systemd/resolved.conf.d/'))) and '..' not in pathlib.Path(path).parts,'unsafe restore target')
                 if r['exists']:need(sha(base64.b64decode(r['data']))==r['sha'],'backup file digest mismatch: '+path)
             if expected_value is None:return d,s
             need(b==expected_value,'backup does not match the prepared snapshot')
@@ -1145,6 +1425,8 @@ def disarm(d):
 
 def race_check(pl,expected=None):
     pl.check_cloud_cache()
+    for path,record in pl.dns_generated.items():need(matches(path,record),'DNS generated source changed before apply: '+path)
+    if pl.runtime_resolver is not None:need(resolver_normalized(pl.runtime_resolver)==resolver_normalized(resolver()),'runtime resolver changed before apply')
     need(pl.watch_globs()==pl.inventory,'configuration file set changed concurrently')
     for path,r in pl.watched.items():need(matches(path,r),'concurrent config modification: '+path)
 def route_command(verb,r,family='-6',elapsed=0):
@@ -1240,7 +1522,7 @@ def restore(d,automatic=False):
         need(not errors,'config conflict; manager reconfiguration withheld')
         if refresh_netplan:run(['netplan','generate'],timeout=30)
         for path in s.get('created_dirs',[]):
-            need(path.startswith(('/etc/netplan','/etc/systemd/network','/etc/NetworkManager/system-connections','/etc/network','/etc/cloud','/etc/sysctl.d','/etc/sysconfig/network-scripts')) and '..' not in pathlib.Path(path).parts,'invalid created-directory record')
+            need(path.startswith(('/etc/netplan','/etc/systemd/network','/etc/NetworkManager/system-connections','/etc/network','/etc/cloud','/etc/sysctl.d','/etc/sysconfig/network-scripts','/etc/systemd/resolved.conf.d')) and '..' not in pathlib.Path(path).parts,'invalid created-directory record')
             directory=p(path)
             if directory.exists():
                 need(not directory.is_symlink() and directory.stat().st_uid==0,'restore directory changed owner/type')
@@ -1276,8 +1558,11 @@ def restore(d,automatic=False):
             restore_runtime(s['before'])
         if 'rules4_raw' in s['before']:restore_rules6(s['before']['rules4_raw'],socket.AF_INET)
         if 'rules6_raw' in s['before']:restore_rules6(s['before']['rules6_raw'])
-        now=wait4(s['before'])
-        if s['before'].get('dns_probe_ok'):run(['getent','ahostsv4','example.com'],timeout=12)
+        restore_resolver(s['before'])
+        now=wait4(dict(s['before'],dns_delta=False))
+        if s['before'].get('dns_probe_ok'):
+            for name in s['before'].get('dns_probes',['example.com']):run(['getent','ahostsv4',name],timeout=12)
+        for zone in s['before'].get('dns_zone_probes',[]):run(['resolvectl','query','--type=SOA','--legend=no',zone],timeout=12)
         for path,r in s['files'].items():need(matches(path,r),'restored file/metadata differs: '+path)
         if refresh_netplan:
             for path,r in s['watched'].items():
@@ -1362,7 +1647,7 @@ def apply(seconds):
                 r['xattrs']=xattrs(temporary);save_backup(d,s)
                 need(matches(path,pl.watched[path]),'concurrent modification before atomic replacement: '+path)
             mutated=True;atomic(p(path),base64.b64decode(r['data']),r['mode'],(r['uid'],r['gid']),(r['atime'],r['mtime']),attrs=pl.watched[path].get('xattrs'),before_replace=staged)
-        apply_actions(pl.actions);verify_nm(pl.actions)
+        apply_actions(pl.actions);verify_nm(pl.actions);restore_resolver(before,after=True)
         restored_rules4=False
         if before.get('rules4_raw') is not None and nl_rule6(family=socket.AF_INET)!=before['rules4_raw']:
             # networkd reconfiguration may discard rules owned by another
